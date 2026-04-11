@@ -179,24 +179,35 @@ A new log file is created for each run. If `$PSScriptRoot` is unavailable (e.g. 
 
 ## How It Works at Scale
 
-The script is designed to handle workspaces with large numbers of indicators (tens of thousands or more) efficiently. It uses a **two-pass approach** for deletion:
+The script is designed to handle workspaces with large numbers of indicators (tens of thousands or more) efficiently. It uses a count-and-drain approach with resilient query fallbacks.
 
-### Pass 1 — Count only
+### Phase 1 - Count before delete
 
-Before deleting anything, the script pages through the API purely to count how many indicators match the filter. No indicator objects are stored in memory during this pass — only a running total is maintained. This gives you an accurate count for the confirmation prompt without holding the entire dataset in RAM.
+Before deleting anything, the script first calls the threat intelligence count endpoint to get an exact count. If that endpoint is unavailable, it falls back to pagination-based counting. During fallback counting, only a running total is maintained; indicator objects are not retained in memory.
 
-### Pass 2 — Fetch one page, delete it, repeat
+### Phase 2 - Fetch, delete, repeat
 
-Rather than loading all indicators into memory before starting deletion, the script fetches one page at a time and immediately deletes that batch before fetching the next. Because deleted indicators disappear from the API, each subsequent query without a pagination token naturally returns the next set of remaining indicators. This loop continues until the API returns an empty page.
+Rather than loading all indicators into memory, the script processes one page at a time and deletes that batch before moving on. Batch fetch uses a resilient shared fetch path (used by both delete mode and list-only mode):
+
+- Primary: filtered query endpoint.
+- Fallback 1: client-side source filtering when filtered query returns 400.
+- Fallback 2: indicator list GET scan when query scan also returns 400.
+
+The loop continues until no more matching items are returned.
+
+### Phase 3 - Optional recount per batch
+
+By default, the script performs an additional recount after each delete batch and updates the reconciled total in progress output. This keeps long-running operations auditable and gives more reliable remaining counts while the dataset changes.
 
 This design has several benefits:
 
 | Concern | How it's handled |
 |---------|-----------------|
 | **Memory usage** | Bounded to one page (~`$BatchSize` objects) at all times, regardless of total indicator count. |
-| **Token expiry** | The bearer token is refreshed at the start of every batch, preventing expiry during long-running deletes. |
+| **Token expiry** | The bearer token is refreshed on a time threshold during long-running runs, reducing auth failures. |
 | **Resilience** | If the script is interrupted, already-deleted indicators are gone. Re-running picks up automatically from wherever it left off — no state file needed. |
-| **Page size** | On the first batch, the script logs how many indicators the API actually returned vs. how many were requested, detecting any server-side cap. |
+| **Endpoint compatibility** | Automatic query-mode and endpoint fallbacks handle API 400 behavior differences across tenants. |
+| **Progress integrity** | Optional per-batch recount helps reconcile remaining work during long-running deletes. |
 
 ### Parallel vs. sequential deletion
 
