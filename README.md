@@ -1,4 +1,4 @@
-# sentinel-ti-maintenance-scripts
+# Microsoft Sentinel - Threat Intelligence - Maintenance Scripts
 
 A community PowerShell toolkit for managing **Microsoft Sentinel Threat Intelligence indicators** via the Azure REST API.
 
@@ -161,9 +161,8 @@ A new log file is created for each run. If `$PSScriptRoot` is unavailable (e.g. 
 **Example log entries:**
 
 ```
-2026-04-11 11:34:55  Run initiated | SubscriptionId: 00000000-0000-0000-0000-00000000000X | ResourceGroup: rg_sentinel01 | Workspace: AVSentinel01 | SourceFilter: Blocklistde, TORExitNodes
-2026-04-11 11:34:58  Page size probe | Requested: 100 | API returned: 100 per page
-2026-04-11 11:35:06  Started | Mode: Delete | SourceFilter: Blocklistde, TORExitNodes | Found: 4800
+2026-04-11 15:11:57  Run initiated | SubscriptionId: 00000000-0000-0000-0000-00000000000X | ResourceGroup: rg_sentinel01 | Workspace: AVSentinel01 | SourceFilter: ThreatViewIPBlock, TORExitNodes
+2026-04-11 15:11:59  Started | Mode: Delete | SourceFilter: baseVISION-SOC-TI-Feed | Found: 1947621
 ```
 
 ---
@@ -212,6 +211,12 @@ This design has several benefits:
 ### Parallel vs. sequential deletion
 
 Within each batch, individual DELETE requests are issued either in parallel (PowerShell 7+ with `ForEach-Object -Parallel`) or sequentially (PowerShell 5.1). The `$ThrottleLimit` setting controls how many concurrent DELETE requests are in flight at once in parallel mode. Setting it too high may trigger `429 Too Many Requests` responses from the API; the default of `3` is a conservative starting point.
+
+### Indicator removal process status
+
+![Cleanup process](docs/images/cleanup-process.png)
+
+> **Note:** Depending on the total number of indicators to delete, the job can take **several hours** to complete. For workspaces with millions of indicators, plan accordingly and ensure the host running the script remains active for the duration.
 
 ---
 
