@@ -1,0 +1,20 @@
+#!/bin/sh
+# Pre-commit hook: blocks commits that contain Azure subscription ID patterns.
+
+# Regex for Azure subscription ID format (8-4-4-4-12 hex groups)
+PATTERN='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+
+# Check staged files for subscription ID patterns
+MATCHES=$(git diff --cached --name-only | xargs grep -En "$PATTERN" 2>/dev/null)
+
+if [ -n "$MATCHES" ]; then
+    echo ""
+    echo "ERROR: Possible Azure subscription ID (GUID) detected in staged files:"
+    echo "$MATCHES"
+    echo ""
+    echo "Remove sensitive values before committing."
+    echo ""
+    exit 1
+fi
+
+exit 0
