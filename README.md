@@ -91,15 +91,15 @@ With the source name identified, set `$SourceFilter` in `Invoke-DeleteSentinelTh
 3. **Edit the configuration** in `Invoke-DeleteSentinelThreatIntelligence.ps1`:
 
    ```powershell
-   $SubscriptionId    = "<your-subscription-id>"
-   $ResourceGroupName = "<your-resource-group>"
-   $WorkspaceName     = "<your-workspace-name>"
-    $SourceFilter      = @("ThreatViewIPBlockList")  # or @("ThreatViewIPBlockList","ThreatViewURLBlockList"); use @() for ALL sources
-   $ListOnly          = $false                    # $true = list only, no deletion
-   $BatchSize         = 1000
-   $ThrottleLimit     = 5                         # parallel threads (PS 7+ only)
-   $Force             = $false                    # $true = skip confirmation prompt
-   $LogFile           = ""                        # leave "" to use default log location
+    $SubscriptionId    = ""                        # Subscription ID of the Sentinel workspace
+    $ResourceGroupName = "rg_sentinel01"
+    $WorkspaceName     = "AVSentinel01"
+    $BatchSize         = 100                       # Number of indicators to delete in each batch
+    $SourceFilter      = @("baseVISION-SOC-TI-Feed")  # use @() for ALL sources
+    $ListOnly          = $false                    # $true = list only, no deletion
+    $ThrottleLimit     = 3                         # parallel threads (PS 7+ only)
+    $Force             = $false                    # $true = skip confirmation prompt
+    $LogFile           = ""                       # leave "" to use default log location
    ```
 
 4. **Run the caller script:**
@@ -121,6 +121,7 @@ With the source name identified, set `$SourceFilter` in `Invoke-DeleteSentinelTh
 | `PageSize` | Int | No | Indicators per API page. Defaults to `100`. |
 | `ListOnly` | Bool | No | When `$true`, lists indicators without deleting. |
 | `ThrottleLimit` | Int | No | Max concurrent DELETE threads. PS 7+ only; ignored on PS 5. |
+| `RecountAfterBatch` | Bool | No | Recounts remaining indicators after each delete batch (default: `$true`). |
 | `Force` | Switch | No | Skips the interactive deletion confirmation prompt. |
 | `LogFile` | String | No | Path to log file. Defaults to `Remove-SentinelThreatIndicator.log` in the script folder. |
 
@@ -180,7 +181,7 @@ A new log file is created for each run. If `$PSScriptRoot` is unavailable (e.g. 
 
 ```
 2026-04-11 11:34:55  Run initiated | SubscriptionId: 00000000-0000-0000-0000-00000000000X | ResourceGroup: rg_sentinel01 | Workspace: AVSentinel01 | SourceFilter: Blocklistde, TORExitNodes
-2026-04-11 11:34:58  Page size probe | Requested: 1000 | API returned: 1000 per page
+2026-04-11 11:34:58  Page size probe | Requested: 100 | API returned: 100 per page
 2026-04-11 11:35:06  Started | Mode: Delete | SourceFilter: Blocklistde, TORExitNodes | Found: 4800
 ```
 
@@ -218,7 +219,7 @@ This design has several benefits:
 
 ### Parallel vs. sequential deletion
 
-Within each batch, individual DELETE requests are issued either in parallel (PowerShell 7+ with `ForEach-Object -Parallel`) or sequentially (PowerShell 5.1). The `$ThrottleLimit` setting controls how many concurrent DELETE requests are in flight at once in parallel mode. Setting it too high may trigger `429 Too Many Requests` responses from the API; the default of `5` is a conservative starting point.
+Within each batch, individual DELETE requests are issued either in parallel (PowerShell 7+ with `ForEach-Object -Parallel`) or sequentially (PowerShell 5.1). The `$ThrottleLimit` setting controls how many concurrent DELETE requests are in flight at once in parallel mode. Setting it too high may trigger `429 Too Many Requests` responses from the API; the default of `3` is a conservative starting point.
 
 ---
 
