@@ -108,25 +108,6 @@ With the source name identified, set `$SourceFilter` in `Invoke-DeleteSentinelTh
    .\Scripts\Invoke-DeleteSentinelThreatIntelligence.ps1
    ```
 
----
-
-## Parameters — `Remove-SentinelThreatIndicator`
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `SubscriptionId` | String | Yes | Azure subscription ID containing the Sentinel workspace. |
-| `ResourceGroupName` | String | Yes | Resource group name of the workspace. |
-| `WorkspaceName` | String | Yes | Log Analytics workspace name linked to Microsoft Sentinel. |
-| `SourceFilter` | String[] | No | Filter by one or more source names. Use an empty array to target all sources. |
-| `PageSize` | Int | No | Indicators per API page. Defaults to `100`. |
-| `ListOnly` | Bool | No | When `$true`, lists indicators without deleting. |
-| `ThrottleLimit` | Int | No | Max concurrent DELETE threads. PS 7+ only; ignored on PS 5. |
-| `RecountAfterBatch` | Bool | No | Recounts remaining indicators after each delete batch (default: `$true`). |
-| `Force` | Switch | No | Skips the interactive deletion confirmation prompt. |
-| `LogFile` | String | No | Path to log file. Defaults to `Remove-SentinelThreatIndicator.log` in the script folder. |
-
----
-
 ## Usage Examples
 
 **List all indicators for specific sources (no deletion):**
