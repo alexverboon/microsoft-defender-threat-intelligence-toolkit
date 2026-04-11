@@ -95,7 +95,7 @@ With the source name identified, set `$SourceFilter` in `Invoke-DeleteSentinelTh
     $ResourceGroupName = "rg_sentinel01"
     $WorkspaceName     = "AVSentinel01"
     $BatchSize         = 100                       # Number of indicators to delete in each batch
-    $SourceFilter      = @("baseVISION-SOC-TI-Feed")  # use @() for ALL sources
+    $SourceFilter      = @("ThreatViewIPBlockList")  # use @() for ALL sources
     $ListOnly          = $false                    # $true = list only, no deletion
     $ThrottleLimit     = 3                         # parallel threads (PS 7+ only)
     $Force             = $false                    # $true = skip confirmation prompt
