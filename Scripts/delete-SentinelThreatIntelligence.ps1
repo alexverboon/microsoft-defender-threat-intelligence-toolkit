@@ -507,7 +507,8 @@ function Remove-SentinelThreatIndicator {
 
         $requestUri = $Uri
         if (-not $requestUri) {
-            $requestUri = "$deleteBase?api-version=$($script:ListApiVersion)&`$top=$Size"
+            # Some tenants reject $top on this endpoint with HTTP 400; rely on server paging via nextLink.
+            $requestUri = "$deleteBase?api-version=$($script:ListApiVersion)"
         }
         $requestUri = Resolve-AbsoluteApiUri -CandidateUri $requestUri
 
@@ -662,6 +663,9 @@ function Remove-SentinelThreatIndicator {
                         Batch          = @()
                         BatchCount     = 0
                         EffectiveSize  = $effectiveSize
+                        FailureStage   = $null
+                        FailureStatusCode = $null
+                        FailureUri     = $null
                         ErrorMessage   = $null
                         ErrorDetail    = $null
                     }
@@ -673,6 +677,9 @@ function Remove-SentinelThreatIndicator {
                     Batch          = $batch
                     BatchCount     = $batchCount
                     EffectiveSize  = $effectiveSize
+                    FailureStage   = $null
+                    FailureStatusCode = $null
+                    FailureUri     = $null
                     ErrorMessage   = $null
                     ErrorDetail    = $null
                 }
@@ -723,12 +730,20 @@ function Remove-SentinelThreatIndicator {
                     continue
                 }
 
+                $failureStage = if (-not $State.UseClientSideSourceFilter) { "filtered-query" }
+                                elseif (-not $State.UseListGetFallback) { "client-side-query-scan" }
+                                else { "list-get-scan" }
+                $failureUri = if ($State.UseListGetFallback) { $State.ListNextPageUri } else { $State.ScanPageUri }
+
                 return [PSCustomObject]@{
                     FetchFailed    = $true
                     EndOfStream    = $true
                     Batch          = @()
                     BatchCount     = 0
                     EffectiveSize  = $Size
+                    FailureStage   = $failureStage
+                    FailureStatusCode = $statusCode
+                    FailureUri     = $failureUri
                     ErrorMessage   = $_.Exception.Message
                     ErrorDetail    = $errorDetail
                 }
@@ -953,7 +968,11 @@ function Remove-SentinelThreatIndicator {
     $printedRateLimitHeaders = $false            # print detailed 429 headers once for diagnostics
     $fetchBatchFailed     = $false
     $fetchBatchErrorText  = $null
+    $endedByRemainingProbe = $false
     $fetchState           = New-FetchState -InitialQueryUri $queryUri -Filter $SourceFilter
+    $fetchRetryCount      = 0
+    $fetchRetryDelaysSec  = @(15, 30, 60, 120, 180) # progressive back-off delays between retries
+    $fetchRetryMaxAttempts = $fetchRetryDelaysSec.Count
 
     function Write-DeleteProgress {
         param([switch]$Force)
@@ -992,12 +1011,73 @@ function Remove-SentinelThreatIndicator {
 
         $fetchResult = Get-ResilientIndicatorBatch -Headers $headers -State $fetchState -Size $PageSize -Sync $sync
         if ($fetchResult.FetchFailed) {
+            $stage = if ($fetchResult.FailureStage) { [string]$fetchResult.FailureStage } else { "unknown" }
+            $activeUri = if ($fetchResult.FailureUri) { [string]$fetchResult.FailureUri } else { $null }
+            $uriPreview = if ($activeUri) {
+                if ($activeUri.Length -gt 180) { "$($activeUri.Substring(0, 180))..." } else { $activeUri }
+            } else {
+                "(null)"
+            }
+            $failureStatus = 0
+            try { $failureStatus = [int]$fetchResult.FailureStatusCode } catch {}
+            Write-Output "INFO: Fetch diagnostic | Stage=$stage | Status=$failureStatus | QueryMode=$script:QueryBodyMode | QueryApiVersion=$script:QueryApiVersion | ListApiVersion=$script:ListApiVersion | PageSize=$PageSize | Processed=$($sync.Processed) | Uri=$uriPreview"
+
+            # Probe remaining count to distinguish endpoint instability from true remaining workload.
+            $sync.CountSubmitted++
+            $remainingProbe = Get-IndicatorTotalCount -Headers $headers `
+                                                    -SubscriptionId $SubscriptionId `
+                                                    -ResourceGroupName $ResourceGroupName `
+                                                    -WorkspaceName $WorkspaceName `
+                                                    -Source $SourceFilter
+            if ($null -ne $remainingProbe) {
+                Write-Output "INFO: Fetch failure probe | Remaining=$remainingProbe"
+                if ([int64]$remainingProbe -eq 0) {
+                    Write-Output "INFO: Remaining count is zero. Treating run as complete despite fetch endpoint errors."
+                    $endedByRemainingProbe = $true
+                    $countIsExact = $true
+                    $totalFound = $sync.Processed
+                    break
+                }
+            }
+
+            if ($fetchRetryCount -lt $fetchRetryMaxAttempts) {
+                if ($PageSize -gt 10) {
+                    $newPageSize = if ($PageSize -gt 50) { 50 } elseif ($PageSize -gt 25) { 25 } else { 10 }
+                    if ($newPageSize -lt $PageSize) {
+                        Write-Warning "Reducing page size from $PageSize to $newPageSize after fetch failure to improve endpoint compatibility."
+                        $PageSize = $newPageSize
+                    }
+                }
+                $delaySec = $fetchRetryDelaysSec[$fetchRetryCount]
+                $fetchRetryCount++
+                $ts = Get-Date -Format 'HH:mm:ss'
+                Write-Warning "[$ts] All fetch paths returned 400 (attempt $fetchRetryCount/$fetchRetryMaxAttempts). Waiting ${delaySec}s before retrying..."
+                if ($fetchResult.ErrorDetail) { Write-Output "  API detail: $($fetchResult.ErrorDetail)" }
+                Start-Sleep -Seconds $delaySec
+
+                # Refresh the token in case the prior failures were auth-related.
+                $freshToken = Get-BearerToken
+                if ($freshToken) { $headers["Authorization"] = "Bearer $freshToken" }
+                # Clear the cached query-body mode so the full payload-mode probe runs fresh.
+                $script:QueryBodyMode   = $null
+                $script:QueryApiVersion = $apiVersion
+                $script:ListApiVersion  = $apiVersion
+                # Reset the fetch state so all fallback paths are re-attempted from scratch.
+                $fetchState = New-FetchState -InitialQueryUri $queryUri -Filter $SourceFilter
+                continue
+            }
+
             Write-Output "ERROR fetching batch — $($fetchResult.ErrorMessage)"
             if ($fetchResult.ErrorDetail) { Write-Output "API detail: $($fetchResult.ErrorDetail)" }
             $fetchBatchFailed = $true
             $fetchBatchErrorText = if ($fetchResult.ErrorDetail) { $fetchResult.ErrorDetail } else { $fetchResult.ErrorMessage }
             break
         }
+        if ($fetchRetryCount -gt 0) {
+            $ts = Get-Date -Format 'HH:mm:ss'
+            Write-Output "[$ts] Fetch recovered after $fetchRetryCount retr$(if ($fetchRetryCount -eq 1) { 'y' } else { 'ies' })."
+        }
+        $fetchRetryCount = 0
 
         if ($fetchResult.EndOfStream) { break }
 
@@ -1253,6 +1333,20 @@ function Remove-SentinelThreatIndicator {
             break
         }
 
+        # Deletions mutate the dataset, which can invalidate continuation links.
+        # In fallback scan modes, restart from the first page each batch to avoid stale-token 400s.
+        if ($fetchState.UseClientSideSourceFilter) {
+            if ($fetchState.UseListGetFallback) {
+                $fetchState.ListNextPageUri = $null
+                $fetchState.SeenListPageLink.Clear()
+            }
+            else {
+                $fetchState.ScanPageUri = $queryUri
+                $fetchState.SeenScanPageLink.Clear()
+            }
+            $fetchState.HadContinuation = $false
+        }
+
         if ($RecountAfterBatch) {
             $sync.CountSubmitted++
             $remainingCount = Get-IndicatorTotalCount -Headers $headers `
@@ -1298,6 +1392,9 @@ function Remove-SentinelThreatIndicator {
 
     $processedTotal = $deleted + $failed
     $countDelta = $totalFound - $processedTotal
+    if ($endedByRemainingProbe) {
+        $countDelta = 0
+    }
     if ($countDelta -ne 0) {
         if ($processedTotal -eq 0 -and $fetchBatchFailed) {
             Write-Warning "Deletion run ended before any items were processed due to query failure. Skipping count reconciliation warning."
@@ -1311,26 +1408,44 @@ function Remove-SentinelThreatIndicator {
 
     if ($countDelta -ne 0) {
         # Recount remaining indicators to verify whether mismatch is drift vs. an inaccurate initial count.
-        $remainingNow   = 0
-        $recountFailed  = $false
-        $recountPageUri = $queryUri
-        $seenRecountLink = [System.Collections.Generic.HashSet[string]]::new()
-        do {
-            try {
-                $sync.QuerySubmitted++
-                $recountResult = Get-IndicatorPage -Headers $headers -Uri $recountPageUri -Source $SourceFilter -Size $PageSize -SkipToken $null
-                $remainingNow += if ($recountResult.Items) { @($recountResult.Items).Count } else { 0 }
-                $recountPageUri = $recountResult.NextLink
-                if ($recountPageUri -and (-not $seenRecountLink.Add($recountPageUri))) {
-                    Write-Output "WARNING: Duplicate pagination link received during recount; stopping to prevent loop."
-                    break
+        # Use the same resilient fetch chain as the main delete loop.
+        $remainingNow        = 0
+        $recountFailed       = $false
+        $recountErrorText    = $null
+        $recountRetryCount   = 0
+        $recountRetryDelays  = @(10, 20, 40)
+        $recountMaxRetries   = $recountRetryDelays.Count
+        $recountPageSize     = $PageSize
+        $recountState        = New-FetchState -InitialQueryUri $queryUri -Filter $SourceFilter
+
+        while ($true) {
+            $recountResult = Get-ResilientIndicatorBatch -Headers $headers -State $recountState -Size $recountPageSize -Sync $sync
+            if ($recountResult.FetchFailed) {
+                if ($recountRetryCount -lt $recountMaxRetries) {
+                    $retryDelay = $recountRetryDelays[$recountRetryCount]
+                    $recountRetryCount++
+                    Write-Output "INFO: Recount fetch failed. Retrying in ${retryDelay}s (attempt $recountRetryCount/$recountMaxRetries)."
+                    Start-Sleep -Seconds $retryDelay
+                    $freshToken = Get-BearerToken
+                    if ($freshToken) { $headers["Authorization"] = "Bearer $freshToken" }
+                    $script:QueryBodyMode   = $null
+                    $script:QueryApiVersion = $apiVersion
+                    $script:ListApiVersion  = $apiVersion
+                    $recountState = New-FetchState -InitialQueryUri $queryUri -Filter $SourceFilter
+                    continue
                 }
-            }
-            catch {
                 $recountFailed = $true
+                $recountErrorText = if ($recountResult.ErrorDetail) { $recountResult.ErrorDetail } else { $recountResult.ErrorMessage }
                 break
             }
-        } while ($recountPageUri)
+
+            $recountRetryCount = 0
+
+            if ($recountResult.EndOfStream) { break }
+
+            $remainingNow += $recountResult.BatchCount
+            $recountPageSize = $recountResult.EffectiveSize
+        }
 
         if (-not $recountFailed) {
             $reconciledFound = $processedTotal + $remainingNow
@@ -1353,6 +1468,7 @@ function Remove-SentinelThreatIndicator {
         }
         else {
             Write-Warning "Count reconciliation mismatch detected. Found=$totalFound, Processed=$processedTotal (Delta=$countDelta). Recount failed."
+            if ($recountErrorText) { Write-Output "Recount last error: $recountErrorText" }
             Write-Log "Count reconciliation | Found: $totalFound | Processed: $processedTotal | Delta: $countDelta | RemainingNow: (recount failed)"
         }
     }
