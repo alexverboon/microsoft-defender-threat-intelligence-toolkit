@@ -9,7 +9,7 @@ function Remove-SentinelThreatIndicator {
     .PARAMETER WorkspaceName
         Log Analytics workspace name linked to Microsoft Sentinel.
     .PARAMETER SourceFilter
-        Filter indicators by source name. Leave empty to target all sources.
+        Filter indicators by one or more source names. Leave empty to target all sources.
     .PARAMETER PageSize
         Number of indicators to retrieve per API page. Defaults to 100.
     .PARAMETER ListOnly
@@ -20,18 +20,38 @@ function Remove-SentinelThreatIndicator {
         Skips the deletion confirmation prompt.
     .PARAMETER LogFile
         Path to the log file. Defaults to Remove-SentinelThreatIndicator.log in the script's folder.
+    .PARAMETER RecountAfterBatch
+        When set, recounts remaining indicators after each delete batch and updates progress totals.
     #>
     param (
         [string]$SubscriptionId,
         [string]$ResourceGroupName,
         [string]$WorkspaceName,
-        [string]$SourceFilter,
+        [string[]]$SourceFilter,
         [int]$PageSize,
         [bool]$ListOnly,
         [int]$ThrottleLimit,
         [switch]$Force,
-        [string]$LogFile = ""
+        [string]$LogFile = "",
+        [bool]$RecountAfterBatch = $true
     )
+
+    # Validate required parameters
+    $configErrors = @()
+    if ([string]::IsNullOrWhiteSpace($SubscriptionId))    { $configErrors += "  - SubscriptionId is empty." }
+    if ([string]::IsNullOrWhiteSpace($ResourceGroupName)) { $configErrors += "  - ResourceGroupName is empty." }
+    if ([string]::IsNullOrWhiteSpace($WorkspaceName))     { $configErrors += "  - WorkspaceName is empty." }
+    if ($configErrors.Count -gt 0) {
+        Write-Error "One or more required parameters are missing:`n$($configErrors -join "`n")"
+        return
+    }
+
+    # Validate Azure login
+    $azContext = Get-AzContext -ErrorAction SilentlyContinue
+    if (-not $azContext) {
+        Write-Warning "You are not logged in to Azure. Please run 'Connect-AzAccount' first."
+        return
+    }
 
     if (-not $LogFile) {
         $logDir  = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
@@ -44,6 +64,9 @@ function Remove-SentinelThreatIndicator {
         $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
         "$timestamp  $Message" | Out-File -FilePath $LogFile -Append -Encoding utf8
     }
+
+    Write-Output "Log file: $LogFile"
+    Write-Log "Run initiated | SubscriptionId: $SubscriptionId | ResourceGroup: $ResourceGroupName | Workspace: $WorkspaceName | SourceFilter: $(if ($SourceFilter) { $SourceFilter -join ', ' } else { '(all sources)' })"
 
     $requiredModules = @('Az.Accounts')
     foreach ($module in $requiredModules) {
@@ -59,7 +82,6 @@ function Remove-SentinelThreatIndicator {
 
     $ProgressIdListCollect   = 10
     $ProgressIdDeleteCollect = 20
-    $ProgressIdDeleteRun     = 30
 
     function Write-Status {
         <#
@@ -82,11 +104,17 @@ function Remove-SentinelThreatIndicator {
         #>
         param(
             [int]$Count,
-            [string]$Scope
+            [string]$Scope,
+            [switch]$IsMinimumCount
         )
 
         $title   = "Confirm Sentinel Indicator Deletion"
-        $message = "You are about to delete $Count indicator(s) $Scope.`n`nThis action cannot be undone."
+        $countText = if ($IsMinimumCount) { "at least $Count" } else { "$Count" }
+        $scopeText = $Scope
+        if ($scopeText -and $scopeText -notmatch '[.!?]$') {
+            $scopeText += "."
+        }
+        $message = "You are about to delete $countText indicator(s) $scopeText`n`nThis action cannot be undone."
         $choices = [System.Management.Automation.Host.ChoiceDescription[]]@(
             (New-Object System.Management.Automation.Host.ChoiceDescription "&Yes", "Proceed with deletion"),
             (New-Object System.Management.Automation.Host.ChoiceDescription "&No", "Cancel and exit")
@@ -134,8 +162,7 @@ function Remove-SentinelThreatIndicator {
         return
     }
 
-    $logSourceFilter = if ($SourceFilter) { $SourceFilter } else { '(all sources)' }
-    $logMode = if ($ListOnly) { 'ListOnly' } else { 'Delete' }
+    $logSourceFilter = if ($SourceFilter) { $SourceFilter -join ', ' } else { '(all sources)' }
 
     $headers = @{
         "Authorization" = "Bearer $token"
@@ -149,6 +176,18 @@ function Remove-SentinelThreatIndicator {
                   "/providers/Microsoft.SecurityInsights"
     $queryUri   = "$baseUri/threatIntelligence/main/queryIndicators?api-version=$apiVersion"
     $deleteBase = "$baseUri/threatIntelligence/main/indicators"
+    $script:QueryBodyMode = $null
+    $script:QueryApiVersion = $apiVersion
+    $script:ListApiVersion = $apiVersion
+
+    function Resolve-AbsoluteApiUri {
+        param([string]$CandidateUri)
+
+        if ([string]::IsNullOrWhiteSpace($CandidateUri)) { return $CandidateUri }
+        if ([System.Uri]::IsWellFormedUriString($CandidateUri, [System.UriKind]::Absolute)) { return $CandidateUri }
+        if ($CandidateUri.StartsWith('/')) { return "https://management.azure.com$CandidateUri" }
+        return "https://management.azure.com/$CandidateUri"
+    }
 
     function Get-IndicatorPage {
         <#
@@ -158,82 +197,484 @@ function Remove-SentinelThreatIndicator {
         param(
             [hashtable]$Headers,
             [string]$Uri,
-            [string]$Source,
+            [string[]]$Source,
             [int]$Size,
             [string]$SkipToken
         )
 
-        $body = [ordered]@{
-            pageSize = $Size
-            sortBy   = @(@{ itemKey = "lastUpdatedTimeUtc"; sortOrder = "descending" })
+        function New-QueryBody {
+            param(
+                [int]$PageSize,
+                [string[]]$SourceNames,
+                [string]$Token,
+                [ValidateSet("legacy", "legacy-pascal", "legacy-no-sort", "sort-single", "sort-single-pascal", "singular-source", "source-string", "condition")]
+                [string]$Mode
+            )
+
+            $body = [ordered]@{ pageSize = $PageSize }
+
+            switch ($Mode) {
+                "legacy" {
+                    $body.sortBy = @(@{ itemKey = "lastUpdatedTimeUtc"; sortOrder = "descending" })
+                    if ($SourceNames) { $body.sources = @($SourceNames) }
+                }
+                "legacy-pascal" {
+                    $body.sortBy = @(@{ itemKey = "LastUpdatedTimeUtc"; sortOrder = "Descending" })
+                    if ($SourceNames) { $body.sources = @($SourceNames) }
+                }
+                "legacy-no-sort" {
+                    if ($SourceNames) { $body.sources = @($SourceNames) }
+                }
+                "sort-single" {
+                    $body.sortBy = @{ itemKey = "lastUpdatedTimeUtc"; sortOrder = "descending" }
+                    if ($SourceNames) { $body.sources = @($SourceNames) }
+                }
+                "sort-single-pascal" {
+                    $body.sortBy = @{ itemKey = "LastUpdatedTimeUtc"; sortOrder = "Descending" }
+                    if ($SourceNames) { $body.sources = @($SourceNames) }
+                }
+                "singular-source" {
+                    if ($SourceNames) { $body.source = @($SourceNames) }
+                }
+                "source-string" {
+                    if ($SourceNames -and $SourceNames.Count -gt 0) { $body.source = [string]$SourceNames[0] }
+                }
+                "condition" {
+                    if ($SourceNames -and $SourceNames.Count -gt 0) {
+                        $clauses = @()
+                        foreach ($src in $SourceNames) {
+                            $clauses += @{
+                                field    = "source"
+                                operator = "Equals"
+                                values   = @("$src")
+                            }
+                        }
+                        $body.condition = @{
+                            conditionConnective = "Or"
+                            clauses             = $clauses
+                        }
+                    }
+                }
+            }
+
+            if ($Token) { $body.skipToken = $Token }
+            return $body
         }
-        if ($Source) { $body.sources = @($Source) }
-        if ($SkipToken) { $body.skipToken = $SkipToken }
 
-        $response = Invoke-RestMethod -Uri $Uri `
-                                      -Headers $Headers `
-                                      -Method POST `
-                                      -Body ($body | ConvertTo-Json -Depth 5) `
-                                      -ErrorAction Stop
+        $effectiveSize = $Size
+        while ($true) {
+            $allModes = @("legacy", "legacy-pascal", "legacy-no-sort", "sort-single", "sort-single-pascal", "singular-source", "source-string", "condition")
+            $probeModes = if ($script:QueryBodyMode) {
+                @($script:QueryBodyMode) + @($allModes | Where-Object { $_ -ne $script:QueryBodyMode })
+            }
+            else {
+                $allModes
+            }
 
-        $nextSkipToken = $null
+            $response = $null
+            $usedMode = $null
+            $lastError = $null
 
-        foreach ($tokenKey in @("skipToken", "nextSkipToken", "continuationToken", "nextContinuationToken")) {
-            $prop = $response.PSObject.Properties | Where-Object { $_.Name -ieq $tokenKey } | Select-Object -First 1
+            foreach ($mode in $probeModes) {
+                $body = New-QueryBody -PageSize $effectiveSize -SourceNames $Source -Token $SkipToken -Mode $mode
+
+                $requestUri = Resolve-AbsoluteApiUri -CandidateUri $Uri
+
+                try {
+                    $response = Invoke-RestMethod -Uri $requestUri `
+                                                  -Headers $Headers `
+                                                  -Method POST `
+                                                  -Body ($body | ConvertTo-Json -Depth 10) `
+                                                  -ErrorAction Stop
+                    $usedMode = $mode
+                    break
+                }
+                catch {
+                    $lastError = $_
+                    $statusCode = 0
+                    try {
+                        if ($_.Exception.Response) {
+                            if ($_.Exception.Response.StatusCode -is [int]) {
+                                $statusCode = [int]$_.Exception.Response.StatusCode
+                            }
+                            elseif ($_.Exception.Response.StatusCode.PSObject.Properties.Name -contains 'value__') {
+                                $statusCode = [int]$_.Exception.Response.StatusCode.value__
+                            }
+                            else {
+                                $statusCode = [int]$_.Exception.Response.StatusCode
+                            }
+                        }
+                    } catch {}
+                    if (-not $statusCode) {
+                        $errText = ""
+                        try { $errText = ($_ | Out-String) } catch {}
+                        if (($_.Exception.Message -match '\b400\b') -or ($errText -match '\b400\b|Bad Request')) {
+                            $statusCode = 400
+                        }
+                    }
+
+                    # On 400, try other payload schema variants before failing.
+                    if ($statusCode -eq 400 -and $probeModes.Count -gt 1) {
+                        continue
+                    }
+
+                    throw
+                }
+            }
+
+            if (-not $response) {
+                $statusCode = 0
+                if ($lastError) {
+                    try {
+                        if ($lastError.Exception.Response) {
+                            if ($lastError.Exception.Response.StatusCode -is [int]) {
+                                $statusCode = [int]$lastError.Exception.Response.StatusCode
+                            }
+                            elseif ($lastError.Exception.Response.StatusCode.PSObject.Properties.Name -contains 'value__') {
+                                $statusCode = [int]$lastError.Exception.Response.StatusCode.value__
+                            }
+                            else {
+                                $statusCode = [int]$lastError.Exception.Response.StatusCode
+                            }
+                        }
+                    } catch {}
+
+                    if (-not $statusCode) {
+                        $errText = ""
+                        try { $errText = ($lastError | Out-String) } catch {}
+                        if (($lastError.Exception.Message -match '\b400\b') -or ($errText -match '\b400\b|Bad Request')) {
+                            $statusCode = 400
+                        }
+                    }
+
+                    if ($statusCode -eq 400 -and $effectiveSize -gt 100) {
+                        $nextSize = [math]::Max([int][math]::Floor($effectiveSize / 2), 100)
+                        if ($nextSize -lt $effectiveSize) {
+                            Write-Output "INFO: API rejected page size $effectiveSize (400). Retrying with $nextSize."
+                            $effectiveSize = $nextSize
+                            continue
+                        }
+                    }
+
+                    if ($statusCode -eq 400) {
+                        $versionCandidates = @()
+                        foreach ($candidate in @("2025-09-01", "2025-07-01-preview", "2024-09-01-preview")) {
+                            if ($candidate -and ($candidate -ne $script:QueryApiVersion)) { $versionCandidates += $candidate }
+                        }
+
+                        foreach ($candidateVersion in $versionCandidates) {
+                            $candidateUri = if ($Uri -match '([?&])api-version=[^&]+') {
+                                [regex]::Replace($Uri, '([?&])api-version=[^&]+', "`$1api-version=$candidateVersion")
+                            }
+                            else {
+                                "$Uri$(if ($Uri -match '\?') { '&' } else { '?' })api-version=$candidateVersion"
+                            }
+
+                            try {
+                                $candidateBody = New-QueryBody -PageSize $effectiveSize -SourceNames $Source -Token $SkipToken -Mode "legacy-no-sort"
+                                $candidateResponse = Invoke-RestMethod -Uri $candidateUri `
+                                                                       -Headers $Headers `
+                                                                       -Method POST `
+                                                                       -Body ($candidateBody | ConvertTo-Json -Depth 10) `
+                                                                       -ErrorAction Stop
+                                $script:QueryApiVersion = $candidateVersion
+                                $response = $candidateResponse
+                                $usedMode = "legacy-no-sort"
+                                Write-Output "INFO: Using query API version '$candidateVersion'."
+                                break
+                            }
+                            catch {}
+                        }
+
+                        if ($response) { break }
+                    }
+
+                    throw $lastError
+                }
+                throw "Query request failed for unknown reason."
+            }
+
+            if (-not $script:QueryBodyMode) {
+                $script:QueryBodyMode = $usedMode
+                Write-Output "INFO: Using query payload mode '$usedMode'."
+            }
+
+            break
+        }
+
+        $nextLink = $null
+        foreach ($linkKey in @("nextLink", "@odata.nextLink", "odata.nextLink", "nextPageLink")) {
+            $prop = $response.PSObject.Properties | Where-Object { $_.Name -ieq $linkKey } | Select-Object -First 1
             if ($prop -and $prop.Value) {
-                $nextSkipToken = [string]$prop.Value
+                $nextLink = Resolve-AbsoluteApiUri -CandidateUri ([string]$prop.Value)
                 break
             }
         }
 
-        if (-not $nextSkipToken) {
-            foreach ($linkKey in @("nextLink", "@odata.nextLink", "odata.nextLink", "nextPageLink")) {
-                $prop = $response.PSObject.Properties | Where-Object { $_.Name -ieq $linkKey } | Select-Object -First 1
-                if (-not $prop -or -not $prop.Value) { continue }
-
-                $nextLink = [string]$prop.Value
-                if ($nextLink -match '(?i)[?&](?:skipToken|\$skiptoken|continuationToken)=([^&]+)') {
-                    $nextSkipToken = [System.Uri]::UnescapeDataString($Matches[1])
+        if (-not $nextLink) {
+            foreach ($tokenKey in @("skipToken", "nextSkipToken", "continuationToken", "nextContinuationToken")) {
+                $prop = $response.PSObject.Properties | Where-Object { $_.Name -ieq $tokenKey } | Select-Object -First 1
+                if ($prop -and $prop.Value) {
+                    $encodedToken = [System.Uri]::EscapeDataString([string]$prop.Value)
+                    $sep = if ($Uri -match '\?') { '&' } else { '?' }
+                    $nextLink = "$Uri${sep}`$skipToken=$encodedToken"
                     break
                 }
+            }
+        }
+
+        $items = @($response.value)
+
+        [PSCustomObject]@{
+            Items         = $items
+            NextLink      = $nextLink
+            EffectiveSize = $effectiveSize
+        }
+    }
+
+    function Get-IndicatorTotalCount {
+        <#
+        .SYNOPSIS
+            Gets an exact TI object count using the preview count endpoint.
+        #>
+        param(
+            [hashtable]$Headers,
+            [string]$SubscriptionId,
+            [string]$ResourceGroupName,
+            [string]$WorkspaceName,
+            [string[]]$Source
+        )
+
+        $countUri = "https://management.azure.com/subscriptions/$SubscriptionId" +
+                    "/resourceGroups/$ResourceGroupName" +
+                    "/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName" +
+                    "/providers/Microsoft.SecurityInsights/threatIntelligence/main/count?api-version=2025-07-01-preview"
+
+        $body = $null
+        if ($Source -and $Source.Count -gt 0) {
+            $clauses = @()
+            foreach ($src in $Source) {
+                $clauses += @{
+                    field    = "source"
+                    operator = "Equals"
+                    values   = @("$src")
+                }
+            }
+            $body = @{
+                condition = @{
+                    conditionConnective = "Or"
+                    clauses             = $clauses
+                }
+            }
+        }
+
+        try {
+            if ($body) {
+                $resp = Invoke-RestMethod -Uri $countUri `
+                                          -Headers $Headers `
+                                          -Method POST `
+                                          -Body ($body | ConvertTo-Json -Depth 10) `
+                                          -ErrorAction Stop
+            }
+            else {
+                $resp = Invoke-RestMethod -Uri $countUri `
+                                          -Headers $Headers `
+                                          -Method POST `
+                                          -ErrorAction Stop
+            }
+
+            if ($null -ne $resp.count) {
+                return [int64]$resp.count
+            }
+        }
+        catch {
+            return $null
+        }
+
+        return $null
+    }
+
+    function Get-IndicatorPageList {
+        <#
+        .SYNOPSIS
+            Lists indicators using GET endpoint as a fallback when queryIndicators POST is rejected.
+        #>
+        param(
+            [hashtable]$Headers,
+            [string]$Uri,
+            [int]$Size
+        )
+
+        $requestUri = $Uri
+        if (-not $requestUri) {
+            $requestUri = "$deleteBase?api-version=$($script:ListApiVersion)&`$top=$Size"
+        }
+        $requestUri = Resolve-AbsoluteApiUri -CandidateUri $requestUri
+
+        $response = $null
+        try {
+            $response = Invoke-RestMethod -Uri $requestUri -Headers $Headers -Method GET -ErrorAction Stop
+        }
+        catch {
+            $statusCode = 0
+            try {
+                if ($_.Exception.Response) {
+                    if ($_.Exception.Response.StatusCode -is [int]) {
+                        $statusCode = [int]$_.Exception.Response.StatusCode
+                    }
+                    elseif ($_.Exception.Response.StatusCode.PSObject.Properties.Name -contains 'value__') {
+                        $statusCode = [int]$_.Exception.Response.StatusCode.value__
+                    }
+                    else {
+                        $statusCode = [int]$_.Exception.Response.StatusCode
+                    }
+                }
+            } catch {}
+
+            if (-not $statusCode) {
+                $errText = ""
+                try { $errText = ($_ | Out-String) } catch {}
+                if (($_.Exception.Message -match '\b400\b') -or ($errText -match '\b400\b|Bad Request')) {
+                    $statusCode = 400
+                }
+            }
+
+            if ($statusCode -eq 400) {
+                foreach ($candidateVersion in @("2025-09-01", "2025-07-01-preview", "2024-09-01-preview")) {
+                    if ($candidateVersion -eq $script:ListApiVersion) { continue }
+                    $candidateUri = if ($requestUri -match '([?&])api-version=[^&]+') {
+                        [regex]::Replace($requestUri, '([?&])api-version=[^&]+', "`$1api-version=$candidateVersion")
+                    }
+                    else {
+                        "$requestUri$(if ($requestUri -match '\?') { '&' } else { '?' })api-version=$candidateVersion"
+                    }
+
+                    try {
+                        $candidateUri = Resolve-AbsoluteApiUri -CandidateUri $candidateUri
+                        $response = Invoke-RestMethod -Uri $candidateUri -Headers $Headers -Method GET -ErrorAction Stop
+                        $script:ListApiVersion = $candidateVersion
+                        Write-Output "INFO: Using list API version '$candidateVersion'."
+                        break
+                    }
+                    catch {}
+                }
+            }
+
+            if (-not $response) { throw }
+        }
+
+        $nextLink = $null
+        foreach ($linkKey in @("nextLink", "@odata.nextLink", "odata.nextLink", "nextPageLink")) {
+            $prop = $response.PSObject.Properties | Where-Object { $_.Name -ieq $linkKey } | Select-Object -First 1
+            if ($prop -and $prop.Value) {
+                $nextLink = Resolve-AbsoluteApiUri -CandidateUri ([string]$prop.Value)
+                break
             }
         }
 
         [PSCustomObject]@{
             Items         = @($response.value)
-            NextSkipToken = $nextSkipToken
+            NextLink      = $nextLink
+            EffectiveSize = $Size
         }
     }
 
-    if ($ListOnly) {
-        Write-Output "Querying indicators$(if ($SourceFilter) { " for source: $SourceFilter" } else { " (all sources)" })..."
+    function New-FetchState {
+        param(
+            [string]$InitialQueryUri,
+            [string[]]$Filter
+        )
 
-        $allIndicators = [System.Collections.Generic.List[object]]::new()
-        $page          = 1
-        $skipToken     = $null
-        $hadPaginationToken = $false
-        $seenSkipToken = [System.Collections.Generic.HashSet[string]]::new()
+        return [ordered]@{
+            SourceFilter               = $Filter
+            UseClientSideSourceFilter  = $false
+            UseListGetFallback         = $false
+            ScanPageUri                = $InitialQueryUri
+            ListNextPageUri            = $null
+            SeenScanPageLink           = [System.Collections.Generic.HashSet[string]]::new()
+            SeenListPageLink           = [System.Collections.Generic.HashSet[string]]::new()
+            HadContinuation            = $false
+        }
+    }
 
-        do {
+    function Get-ResilientIndicatorBatch {
+        param(
+            [hashtable]$Headers,
+            [hashtable]$State,
+            [int]$Size,
+            [hashtable]$Sync
+        )
+
+        while ($true) {
             try {
-                $pageResult = Get-IndicatorPage -Headers $headers -Uri $queryUri -Source $SourceFilter -Size $PageSize -SkipToken $skipToken
-                $batch = $pageResult.Items
-                $batchCount = if ($batch) { @($batch).Count } else { 0 }
-                $skipToken = $pageResult.NextSkipToken
-                if ($skipToken) { $hadPaginationToken = $true }
+                if ($Sync) { $Sync.QuerySubmitted++ }
 
-                if ($batchCount -gt 0) {
-                    $allIndicators.AddRange([object[]]@($batch))
-                    Write-Progress -Activity "Collecting Threat Intelligence Indicators" `
-                                   -Id $ProgressIdListCollect `
-                                   -Status "Page $page | Fetched: $batchCount | Total so far: $($allIndicators.Count)" `
-                                   -PercentComplete 0
-                    $page++
+                if ($State.UseClientSideSourceFilter) {
+                    if ($State.UseListGetFallback) {
+                        $pageResult = Get-IndicatorPageList -Headers $Headers -Uri $State.ListNextPageUri -Size $Size
+                    }
+                    else {
+                        $pageResult = Get-IndicatorPage -Headers $Headers -Uri $State.ScanPageUri -Source $null -Size $Size -SkipToken $null
+                    }
+
+                    $rawBatch = @($pageResult.Items)
+                    $batch = @($rawBatch | Where-Object { $State.SourceFilter -contains $_.properties.source })
+                    $batchCount = $batch.Count
+
+                    if ($State.UseListGetFallback) {
+                        $State.ListNextPageUri = $pageResult.NextLink
+                        if ($State.ListNextPageUri) {
+                            $State.HadContinuation = $true
+                            if (-not $State.SeenListPageLink.Add($State.ListNextPageUri)) {
+                                Write-Output "WARNING: Duplicate pagination link received during list fallback scan; stopping to prevent loop."
+                                $State.ListNextPageUri = $null
+                            }
+                        }
+                    }
+                    else {
+                        $State.ScanPageUri = $pageResult.NextLink
+                        if ($State.ScanPageUri) {
+                            $State.HadContinuation = $true
+                            if (-not $State.SeenScanPageLink.Add($State.ScanPageUri)) {
+                                Write-Output "WARNING: Duplicate pagination link received during client-side source filtering; stopping to prevent loop."
+                                $State.ScanPageUri = $null
+                            }
+                        }
+                    }
+                }
+                else {
+                    $pageResult = Get-IndicatorPage -Headers $Headers -Uri $queryUri -Source $State.SourceFilter -Size $Size -SkipToken $null
+                    $batch = @($pageResult.Items)
+                    $batchCount = $batch.Count
                 }
 
-                if ($skipToken -and (-not $seenSkipToken.Add($skipToken))) {
-                    Write-Output "WARNING: Duplicate pagination token received; stopping to prevent loop."
-                    break
+                $effectiveSize = $pageResult.EffectiveSize
+
+                if ($batchCount -eq 0) {
+                    if ($State.UseClientSideSourceFilter -and (($State.UseListGetFallback -and $State.ListNextPageUri) -or ((-not $State.UseListGetFallback) -and $State.ScanPageUri))) {
+                        # Current page had no matching source; continue scanning remaining pages.
+                        continue
+                    }
+
+                    return [PSCustomObject]@{
+                        FetchFailed    = $false
+                        EndOfStream    = $true
+                        Batch          = @()
+                        BatchCount     = 0
+                        EffectiveSize  = $effectiveSize
+                        ErrorMessage   = $null
+                        ErrorDetail    = $null
+                    }
+                }
+
+                return [PSCustomObject]@{
+                    FetchFailed    = $false
+                    EndOfStream    = $false
+                    Batch          = $batch
+                    BatchCount     = $batchCount
+                    EffectiveSize  = $effectiveSize
+                    ErrorMessage   = $null
+                    ErrorDetail    = $null
                 }
             }
             catch {
@@ -242,11 +683,94 @@ function Remove-SentinelThreatIndicator {
                     $reader      = [System.IO.StreamReader]::new($_.Exception.Response.GetResponseStream())
                     $errorDetail = $reader.ReadToEnd()
                 } catch {}
-                Write-Output "ERROR querying page $page — $($_.Exception.Message)"
-                if ($errorDetail) { Write-Output "API detail: $errorDetail" }
-                break
+
+                $statusCode = 0
+                try {
+                    if ($_.Exception.Response) {
+                        if ($_.Exception.Response.StatusCode -is [int]) {
+                            $statusCode = [int]$_.Exception.Response.StatusCode
+                        }
+                        elseif ($_.Exception.Response.StatusCode.PSObject.Properties.Name -contains 'value__') {
+                            $statusCode = [int]$_.Exception.Response.StatusCode.value__
+                        }
+                        else {
+                            $statusCode = [int]$_.Exception.Response.StatusCode
+                        }
+                    }
+                } catch {}
+
+                if (-not $statusCode) {
+                    $errText = ""
+                    try { $errText = ($_ | Out-String) } catch {}
+                    if (($_.Exception.Message -match '\b400\b') -or ($errText -match '\b400\b|Bad Request')) {
+                        $statusCode = 400
+                    }
+                }
+
+                if (($statusCode -eq 400) -and (-not $State.UseClientSideSourceFilter) -and $State.SourceFilter -and $State.SourceFilter.Count -gt 0) {
+                    Write-Warning "Source-filtered query rejected (400). Falling back to client-side source filtering with paged scan."
+                    $State.UseClientSideSourceFilter = $true
+                    $State.ScanPageUri = $queryUri
+                    $State.SeenScanPageLink.Clear()
+                    continue
+                }
+
+                if (($statusCode -eq 400) -and $State.UseClientSideSourceFilter -and (-not $State.UseListGetFallback)) {
+                    Write-Warning "Query scan endpoint rejected (400). Falling back to indicator list GET scan."
+                    $State.UseListGetFallback = $true
+                    $State.ListNextPageUri = $null
+                    $State.SeenListPageLink.Clear()
+                    continue
+                }
+
+                return [PSCustomObject]@{
+                    FetchFailed    = $true
+                    EndOfStream    = $true
+                    Batch          = @()
+                    BatchCount     = 0
+                    EffectiveSize  = $Size
+                    ErrorMessage   = $_.Exception.Message
+                    ErrorDetail    = $errorDetail
+                }
             }
-        } while ($skipToken)
+        }
+    }
+
+    if ($ListOnly) {
+        Write-Output "Querying indicators$(if ($SourceFilter) { " for source(s): $($SourceFilter -join ', ')" } else { " (all sources)" })..."
+
+        $allIndicators = [System.Collections.Generic.List[object]]::new()
+        $page          = 1
+        $fetchState    = New-FetchState -InitialQueryUri $queryUri -Filter $SourceFilter
+        $hadPaginationToken = $false
+
+        while ($true) {
+            $fetchResult = Get-ResilientIndicatorBatch -Headers $headers -State $fetchState -Size $PageSize -Sync $null
+            if ($fetchResult.FetchFailed) {
+                Write-Output "ERROR querying page $page — $($fetchResult.ErrorMessage)"
+                if ($fetchResult.ErrorDetail) { Write-Output "API detail: $($fetchResult.ErrorDetail)" }
+                return
+            }
+            if ($fetchResult.EndOfStream) { break }
+
+            $batch = $fetchResult.Batch
+            $batchCount = $fetchResult.BatchCount
+            $PageSize = $fetchResult.EffectiveSize
+            $hadPaginationToken = $fetchState.HadContinuation
+
+            $allIndicators.AddRange([object[]]@($batch))
+            if ($page -eq 1) {
+                Write-Log "Page size probe | Requested: $PageSize | API returned: $batchCount per page"
+                if ($batchCount -lt $PageSize) {
+                    Write-Output "INFO: Requested page size $PageSize but API returned $batchCount — API may be capping the page size."
+                }
+            }
+            Write-Progress -Activity "Collecting Threat Intelligence Indicators" `
+                           -Id $ProgressIdListCollect `
+                           -Status "Page $page | Fetched: $batchCount | Total so far: $($allIndicators.Count)" `
+                           -PercentComplete 0
+            $page++
+        }
 
         Write-Progress -Activity "Collecting Threat Intelligence Indicators" -Id $ProgressIdListCollect -Completed
 
@@ -255,7 +779,8 @@ function Remove-SentinelThreatIndicator {
         }
 
         if ($allIndicators.Count -eq 0) {
-            Write-Output "No indicators found$(if ($SourceFilter) { " for source '$SourceFilter'" })."
+            Write-Output "No indicators found$(if ($SourceFilter) { " for source(s) '$($SourceFilter -join "', '")'" })."
+            Write-Log "Completed | Mode: ListOnly | SourceFilter: $logSourceFilter | Found: 0"
             return
         }
 
@@ -299,80 +824,104 @@ function Remove-SentinelThreatIndicator {
     Write-Output "===== Preflight ====="
     Write-Status -Level PASS -Message "Access token acquired."
     Write-Status -Level INFO -Message "Target workspace: $WorkspaceName"
-    Write-Status -Level INFO -Message "Source filter: $(if ($SourceFilter) { $SourceFilter } else { "(all sources)" })"
+    Write-Status -Level INFO -Message "Source filter: $(if ($SourceFilter) { $SourceFilter -join ', ' } else { "(all sources)" })"
     Write-Status -Level INFO -Message "Execution mode: $(if ($PSVersionTable.PSVersion.Major -ge 7 -and $ThrottleLimit -gt 1) { "Parallel (Throttle=$ThrottleLimit)" } else { "Sequential" })"
     Write-Output "====================="
 
-    # First pass: count how many indicators exist
-    Write-Output "Querying indicators$(if ($SourceFilter) { " for source: $SourceFilter" } else { " (all sources)" })..."
+    # Pass 1: Count indicators using exact count API; fallback to pagination count when unavailable.
+    Write-Output "Counting indicators$(if ($SourceFilter) { " for source(s): $($SourceFilter -join ', ')" } else { " (all sources)" })..."
 
-    $indicatorsToDelete = [System.Collections.Generic.List[object]]::new()
-    $totalPages         = 0
-    $countPage          = 1
-    $skipToken          = $null
-    $hadPaginationToken = $false
-    $seenSkipToken      = [System.Collections.Generic.HashSet[string]]::new()
+    $countIsExact = $false
+    $totalFound   = Get-IndicatorTotalCount -Headers $headers `
+                                            -SubscriptionId $SubscriptionId `
+                                            -ResourceGroupName $ResourceGroupName `
+                                            -WorkspaceName $WorkspaceName `
+                                            -Source $SourceFilter
 
-    do {
-        try {
-            $pageResult = Get-IndicatorPage -Headers $headers -Uri $queryUri -Source $SourceFilter -Size $PageSize -SkipToken $skipToken
-            $batch      = $pageResult.Items
-            $batchCount = if ($batch) { @($batch).Count } else { 0 }
-            $skipToken  = $pageResult.NextSkipToken
-            if ($skipToken) { $hadPaginationToken = $true }
+    if ($null -ne $totalFound) {
+        $countIsExact = $true
+        Write-Status -Level PASS -Message "Exact count retrieved via TI count API: $totalFound"
+    }
+    else {
+        Write-Output "WARNING: Exact count API unavailable. Falling back to pagination-based counting."
+    }
 
-            if ($batchCount -gt 0) {
-                $indicatorsToDelete.AddRange([object[]]@($batch))
-                $totalPages++
-                Write-Progress -Activity "Collecting Indicators For Deletion" `
-                               -Id $ProgressIdDeleteCollect `
-                               -Status "Page $countPage | Fetched: $batchCount | Total so far: $($indicatorsToDelete.Count)" `
-                               -PercentComplete 0
-                $countPage++
-            }
+    if (-not $countIsExact) {
 
-            if ($skipToken -and (-not $seenSkipToken.Add($skipToken))) {
-                Write-Output "WARNING: Duplicate pagination token received during count; stopping to prevent loop."
-                break
-            }
-        }
-        catch {
-            $errorDetail = ""
+        $totalFound    = 0
+        $countPage     = 1
+        $nextPageUri   = $queryUri
+        $seenPageLink  = [System.Collections.Generic.HashSet[string]]::new()
+        $firstBatch    = $true
+
+        do {
             try {
-                $reader      = [System.IO.StreamReader]::new($_.Exception.Response.GetResponseStream())
-                $errorDetail = $reader.ReadToEnd()
-            } catch {}
-            Write-Output "ERROR querying page $countPage — $($_.Exception.Message)"
-            if ($errorDetail) { Write-Output "API detail: $errorDetail" }
-            return
-        }
-    } while ($skipToken)
+                $pageResult = Get-IndicatorPage -Headers $headers -Uri $nextPageUri -Source $SourceFilter -Size $PageSize -SkipToken $null
+                $batchCount = if ($pageResult.Items) { @($pageResult.Items).Count } else { 0 }
+                $PageSize   = $pageResult.EffectiveSize
+                $nextPageUri = $pageResult.NextLink
 
-    Write-Progress -Activity "Collecting Indicators For Deletion" -Id $ProgressIdDeleteCollect -Completed
+                if ($batchCount -gt 0) {
+                    if ($firstBatch) {
+                        $firstBatch = $false
+                        Write-Log "Page size probe | Requested: $PageSize | API returned: $batchCount per page"
+                        if ($batchCount -lt $PageSize) {
+                            Write-Output "INFO: Requested page size $PageSize but API returned $batchCount — API may be capping the page size."
+                        }
+                    }
+                    $totalFound += $batchCount
+                    Write-Progress -Activity "Counting Indicators" `
+                                   -Id $ProgressIdDeleteCollect `
+                                   -Status "Page $countPage | Counted so far: $totalFound" `
+                                   -PercentComplete 0
+                    $countPage++
+                }
 
-    $totalFound = $indicatorsToDelete.Count
+                if ($nextPageUri -and (-not $seenPageLink.Add($nextPageUri))) {
+                    Write-Output "WARNING: Duplicate pagination link received during count; stopping to prevent loop."
+                    break
+                }
+            }
+            catch {
+                $errorDetail = ""
+                try {
+                    $reader      = [System.IO.StreamReader]::new($_.Exception.Response.GetResponseStream())
+                    $errorDetail = $reader.ReadToEnd()
+                } catch {}
+                Write-Output "ERROR counting page $countPage — $($_.Exception.Message)"
+                if ($errorDetail) { Write-Output "API detail: $errorDetail" }
+                return
+            }
+        } while ($nextPageUri)
 
-    if (-not $hadPaginationToken -and $totalFound -ge $PageSize) {
-        Write-Output "WARNING: API returned a full page ($PageSize) but no continuation token. Increase page size or use API version with pagination support if available."
+        Write-Progress -Activity "Counting Indicators" -Id $ProgressIdDeleteCollect -Completed
     }
 
     if ($totalFound -eq 0) {
-        Write-Output "No indicators found$(if ($SourceFilter) { " for source '$SourceFilter'" }). Nothing to delete."
+        Write-Output "No indicators found$(if ($SourceFilter) { " for source(s) '$($SourceFilter -join "', '")'" }). Nothing to delete."
         Write-Log "Completed | Mode: Delete | SourceFilter: $logSourceFilter | Deleted: 0 | Nothing to delete"
         return
     }
 
     Write-Output ""
-    Write-Output "Found $totalFound indicator(s) across $totalPages page(s)$(if ($SourceFilter) { " from source '$SourceFilter'" })."
+    if ($countIsExact) {
+        Write-Output "Found $totalFound indicator(s)$(if ($SourceFilter) { " from source(s) '$($SourceFilter -join "', '")'" })."
+    } else {
+        Write-Warning "Initial count is incomplete due to pagination behavior. Continuing with a minimum count of $totalFound."
+        Write-Output "Found at least $totalFound indicator(s)$(if ($SourceFilter) { " from source(s) '$($SourceFilter -join "', '")'" })."
+    }
     Write-Output ""
-    Write-Log "Started | Mode: Delete | SourceFilter: $logSourceFilter | Found: $totalFound"
+    Write-Log "Started | Mode: Delete | SourceFilter: $logSourceFilter | Found: $(if ($countIsExact) { $totalFound } else { ">=$totalFound (count incomplete)" })"
 
     # Confirm before deleting
-    $scopeMsg = if ($SourceFilter) { "from source '$SourceFilter'" } else { "from ALL sources" }
+    $scopeMsg = if ($SourceFilter) { "from source(s) '$($SourceFilter -join "', '")'" } else { "from ALL sources" }
+    if (-not $countIsExact) {
+        $scopeMsg = "$scopeMsg`n`nNote: initial count is a minimum estimate due to pagination behavior."
+    }
     if ($Force) {
         $confirmed = $true
     } else {
-        $confirmed = Confirm-Deletion -Count $totalFound -Scope $scopeMsg
+        $confirmed = Confirm-Deletion -Count $totalFound -Scope $scopeMsg -IsMinimumCount:(-not $countIsExact)
     }
 
     if (-not $confirmed) {
@@ -381,205 +930,350 @@ function Remove-SentinelThreatIndicator {
         return
     }
 
-    # Delete from the pre-collected list so each indicator is processed once.
-    $sync       = [hashtable]::Synchronized(@{ Deleted = 0; Failed = 0; Processed = 0 })
-    $failedBag  = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
-    $startTime  = [datetime]::UtcNow
+    # Pass 2: Fetch one page at a time and delete it, then re-query from the start.
+    # Not using a skipToken between batches avoids pagination inconsistency after deletions.
+    $sync        = [hashtable]::Synchronized(@{ Deleted = 0; Failed = 0; Processed = 0; DeleteSubmitted = 0; QuerySubmitted = 0; CountSubmitted = 0; Retry429 = 0 })
+    $failedBag   = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
+    $startTime   = [datetime]::UtcNow
     $useParallel = ($PSVersionTable.PSVersion.Major -ge 7) -and ($ThrottleLimit -gt 1)
 
     Write-Output ""
     if ($useParallel) {
         Write-Output "Running parallel deletes (throttle: $ThrottleLimit concurrent requests)..."
+    } else {
+        Write-Output "Running sequential deletes..."
     }
     Write-Output ""
+    
+    $globalStartTime      = [datetime]::UtcNow
+    $lastProgressTime     = [datetime]::UtcNow
+    $progressIntervalSec  = 30
+    $tokenAcquiredAt      = [datetime]::UtcNow   # token was just fetched above before confirmation
+    $tokenRefreshMinutes  = 45                   # Az tokens last ~60 min; refresh at 45
+    $printedRateLimitHeaders = $false            # print detailed 429 headers once for diagnostics
+    $fetchBatchFailed     = $false
+    $fetchBatchErrorText  = $null
+    $fetchState           = New-FetchState -InitialQueryUri $queryUri -Filter $SourceFilter
 
-    if ($useParallel) {
-        $indicatorsToDelete | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
-            $s         = $using:sync
-            $bag       = $using:failedBag
-            $total     = $using:totalFound
-            $startT    = $using:startTime
-            $hdrs      = $using:headers
-            $delBase   = $using:deleteBase
-            $apiVer    = $using:apiVersion
-            $progressId = $using:ProgressIdDeleteRun
+    function Write-DeleteProgress {
+        param([switch]$Force)
 
-            $name      = $_.name
-            $deleteUri = "$delBase/$name`?api-version=$apiVer"
-
-            # Helper: extract Retry-After seconds from a 429 response
-            $getRetryAfter = {
-                param($ex)
-                $ra = 10  # default backoff if header missing
-                try {
-                    $raHeader = $ex.Exception.Response.Headers.GetValues("Retry-After") | Select-Object -First 1
-                    if ($raHeader) { $ra = [int]$raHeader }
-                } catch {}
-                $ra
-            }
-
-            $maxRetries    = 3
-            $attempt       = 0
-            $deleteSuccess = $false
-            $did401Refresh = $false
-
-            do {
-                $attempt++
-                try {
-                    Invoke-RestMethod -Uri $deleteUri -Headers $hdrs -Method DELETE -ErrorAction Stop | Out-Null
-                    $s.Deleted++
-                    $deleteSuccess = $true
-                }
-                catch {
-                    $sc = if ($_.Exception.Response) { $_.Exception.Response.StatusCode.value__ } else { 0 }
-
-                    # Refresh token once per indicator when a 401 occurs.
-                    if ($sc -eq 401 -and -not $did401Refresh) {
-                        try {
-                            $tokenObj = Get-AzAccessToken -ResourceUrl "https://management.azure.com/" -ErrorAction Stop
-                            $newToken = if ($tokenObj.Token -is [System.Security.SecureString]) {
-                                [System.Net.NetworkCredential]::new("", $tokenObj.Token).Password
-                            } else {
-                                $tokenObj.Token
-                            }
-
-                            if ($newToken) {
-                                $hdrs["Authorization"] = "Bearer $newToken"
-                                $did401Refresh = $true
-                                Write-Warning "  401 Unauthorized - token refreshed, retrying..."
-                                $attempt--  # do not count token refresh as a retry attempt
-                                continue
-                            }
-                        } catch {}
-                    }
-
-                    if ($sc -eq 429 -and $attempt -lt $maxRetries) {
-                        $wait = & $getRetryAfter $_
-                        Write-Warning "  429 Too Many Requests — waiting ${wait}s before retry (attempt $attempt/$maxRetries)..."
-                        Start-Sleep -Seconds $wait
-                        # loop back and retry
-                    }
-                    else {
-                        $errDetail = ""
-                        try { $errDetail = [System.IO.StreamReader]::new($_.Exception.Response.GetResponseStream()).ReadToEnd() } catch {}
-                        $sd = if ($_.Exception.Response) { $_.Exception.Response.StatusCode.ToString() } else { $_.Exception.Message }
-                        $d  = if ($errDetail) { $errDetail } elseif ($_.Exception.Message) { $_.Exception.Message } else { "" }
-                        $s.Failed++
-                        $bag.Add($name)
-                        Write-Warning "  FAILED [$sc $sd] $name$(if ($d) { " — $d" })"
-                        $deleteSuccess = $true  # exit retry loop
-                    }
-                }
-            } while (-not $deleteSuccess)
-
-            $s.Processed++
-            $proc      = $s.Processed
-            $del       = $s.Deleted
-            $fail      = $s.Failed
-            $remaining = [math]::Max($total - $proc, 0)
-            $pct       = if ($total -gt 0) { [math]::Round(($proc / $total) * 100) } else { 0 }
-            $elapsed   = ([datetime]::UtcNow - $startT).TotalSeconds
-            $avgSec    = if ($proc -gt 0) { $elapsed / $proc } else { 0 }
-            $etaSec    = [math]::Round($avgSec * $remaining)
-            $etaStr    = if ($proc -gt 0 -and $remaining -gt 0) {
-                             $ts = [timespan]::FromSeconds($etaSec)
-                             if     ($ts.TotalHours -ge 1)   { "{0}h {1}m {2}s" -f [int]$ts.TotalHours, $ts.Minutes, $ts.Seconds }
-                             elseif ($ts.TotalMinutes -ge 1)  { "{0}m {1}s" -f $ts.Minutes, $ts.Seconds }
-                             else                             { "{0}s" -f $ts.Seconds }
-                         } else { "calculating..." }
-            Write-Progress -Activity "Deleting Threat Intelligence Indicators" `
-                           -Id $progressId `
-                           -Status "Deleted: $del/$total  Failed: $fail  Remaining: ~$remaining  ETA: $etaStr" `
-                           -PercentComplete ([math]::Min($pct, 100))
+        $now = [datetime]::UtcNow
+        if (-not $Force -and (($now - $lastProgressTime).TotalSeconds -lt $progressIntervalSec)) {
+            return
         }
+
+        $elapsed = ($now - $globalStartTime).TotalSeconds
+        $rate = if ($elapsed -gt 0 -and $sync.Processed -gt 0) { $sync.Processed / $elapsed } else { 0 }
+        $remaining = [math]::Max($totalFound - $sync.Processed, 0)
+        $etaSec = if ($rate -gt 0) { [math]::Round($remaining / $rate) } else { 0 }
+        $etaStr = if ($remaining -gt 0) {
+            if ($etaSec -ge 3600)  { "{0}h {1}m" -f [int]($etaSec/3600), [int](($etaSec%3600)/60) }
+            elseif ($etaSec -ge 60) { "{0}m {1}s" -f [int]($etaSec/60), $etaSec%60 }
+            else { "{0}s" -f $etaSec }
+        } else { "Done" }
+        $ts = Get-Date -Format 'HH:mm:ss'
+        $rateStr = if ($rate -gt 0) { "{0:F1}/s" -f $rate } else { "--" }
+        Write-Output "[$ts] Progress: Deleted=$($sync.Deleted) | Failed=$($sync.Failed) | Processed=$($sync.Processed)/$totalFound | ReqSubmitted(D/Q)=$($sync.DeleteSubmitted)/$($sync.QuerySubmitted) | 429Retries=$($sync.Retry429) | Rate=$rateStr | ETA=$etaStr"
+        $lastProgressTime = $now
     }
-    else {
-        foreach ($indicator in @($indicatorsToDelete)) {
-            $name      = $indicator.name
-            $deleteUri = "$deleteBase/$name`?api-version=$apiVersion"
 
-            $maxRetries    = 3
-            $attempt       = 0
-            $deleteSuccess = $false
-            $did401Refresh = $false
+    while ($true) {
+        # Fetch only the first filtered page each iteration; after deletion, the next
+        # first page naturally contains the next set to process. This avoids unstable
+        # continuation links while still draining the source.
+        if (([datetime]::UtcNow - $tokenAcquiredAt).TotalMinutes -ge $tokenRefreshMinutes) {
+            $freshToken = Get-BearerToken
+            if ($freshToken) {
+                $headers["Authorization"] = "Bearer $freshToken"
+                $tokenAcquiredAt = [datetime]::UtcNow
+            }
+        }
 
-            do {
-                $attempt++
-                try {
-                    Invoke-RestMethod -Uri $deleteUri -Headers $headers -Method DELETE -ErrorAction Stop | Out-Null
-                    $sync.Deleted++
-                    $deleteSuccess = $true
-                }
-                catch {
-                    $errorDetail = ""
+        $fetchResult = Get-ResilientIndicatorBatch -Headers $headers -State $fetchState -Size $PageSize -Sync $sync
+        if ($fetchResult.FetchFailed) {
+            Write-Output "ERROR fetching batch — $($fetchResult.ErrorMessage)"
+            if ($fetchResult.ErrorDetail) { Write-Output "API detail: $($fetchResult.ErrorDetail)" }
+            $fetchBatchFailed = $true
+            $fetchBatchErrorText = if ($fetchResult.ErrorDetail) { $fetchResult.ErrorDetail } else { $fetchResult.ErrorMessage }
+            break
+        }
+
+        if ($fetchResult.EndOfStream) { break }
+
+        $batch      = $fetchResult.Batch
+        $batchCount = $fetchResult.BatchCount
+        $PageSize   = $fetchResult.EffectiveSize
+
+        $processedBeforeBatch = $sync.Processed
+
+        if ($useParallel) {
+            $batchArray = @($batch)
+            # Start with modest chunks so progress stays visible and request bursts stay controlled.
+            $parallelChunkSize = [math]::Max(($ThrottleLimit * 4), 12)
+            $parallelChunkSize = [math]::Min($parallelChunkSize, 40)
+            $parallelChunkMin  = [math]::Max(($ThrottleLimit * 2), 6)
+            $parallelChunkMax  = [math]::Max(($ThrottleLimit * 12), 40)
+            $parallelInterChunkDelayMs = 150
+
+            $offset = 0
+            while ($offset -lt $batchArray.Count) {
+                $chunkEnd = [math]::Min(($offset + $parallelChunkSize - 1), ($batchArray.Count - 1))
+                $chunk = @($batchArray[$offset..$chunkEnd])
+                $chunkLen = $chunk.Count
+                $retry429BeforeChunk = $sync.Retry429
+
+                $chunk | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+                $s          = $using:sync
+                $bag        = $using:failedBag
+                $hdrs       = $using:headers
+                $delBase    = $using:deleteBase
+                $apiVer     = $using:apiVersion
+
+                $name      = $_.name
+                $deleteUri = "$delBase/$name`?api-version=$apiVer"
+
+                $getRetryAfter = {
+                    param($ex)
+                    $raw = $null
+                    $ra = 10
                     try {
-                        $reader      = [System.IO.StreamReader]::new($_.Exception.Response.GetResponseStream())
-                        $errorDetail = $reader.ReadToEnd()
+                        $raw = $ex.Exception.Response.Headers.GetValues("Retry-After") | Select-Object -First 1
                     } catch {}
-
-                    $statusCode = if ($_.Exception.Response) { $_.Exception.Response.StatusCode.value__ } else { 0 }
-
-                    # On 401 Unauthorized, refresh the token once per indicator and retry.
-                    if ($statusCode -eq 401 -and -not $did401Refresh) {
-                        Write-Output "  INFO: Token expired, refreshing..."
-                        $newToken = Get-BearerToken
-                        if ($newToken) {
-                            $token = $newToken
-                            $headers["Authorization"] = "Bearer $token"
-                            $did401Refresh = $true
-                            $attempt--  # do not count token refresh as a retry attempt
-                            continue
-                        } else {
-                            $errorDetail   = "Could not refresh access token."
-                            $deleteSuccess = $true  # give up
+                    if ($raw) {
+                        $parsedSeconds = 0
+                        if ([int]::TryParse([string]$raw, [ref]$parsedSeconds)) {
+                            $ra = [math]::Max($parsedSeconds, 1)
+                        }
+                        else {
+                            $retryAt = [datetimeoffset]::MinValue
+                            if ([datetimeoffset]::TryParse([string]$raw, [ref]$retryAt)) {
+                                $delta = [math]::Ceiling(($retryAt - [datetimeoffset]::UtcNow).TotalSeconds)
+                                $ra = [math]::Max($delta, 1)
+                            }
                         }
                     }
-                    # On 429 Too Many Requests, back off and retry
-                    elseif ($statusCode -eq 429 -and $attempt -lt $maxRetries) {
-                        $retryAfter = 10  # default backoff
-                        try {
-                            $raHeader = $_.Exception.Response.Headers.GetValues("Retry-After") | Select-Object -First 1
-                            if ($raHeader) { $retryAfter = [int]$raHeader }
-                        } catch {}
-                        Write-Output "  INFO: Rate limited (429). Waiting ${retryAfter}s before retry (attempt $attempt/$maxRetries)..."
-                        Start-Sleep -Seconds $retryAfter
-                        # loop back and retry
-                    }
-                    else {
-                        $sync.Failed++
-                        $failedBag.Add($name)
-
-                        $statusDesc = if ($_.Exception.Response) { $_.Exception.Response.StatusCode.ToString() } else { $_.Exception.Message }
-                        $detail     = if ($errorDetail) { $errorDetail } elseif ($_.Exception.Message) { $_.Exception.Message } else { "" }
-                        Write-Output "  FAILED [$statusCode $statusDesc] $name$(if ($detail) { " — $detail" })"
-                        $deleteSuccess = $true  # exit retry loop
+                    [pscustomobject]@{
+                        Raw         = $raw
+                        Seconds     = $ra
+                        ResumeAtUtc = ([datetime]::UtcNow).AddSeconds($ra)
                     }
                 }
-            } while (-not $deleteSuccess)
 
-            $sync.Processed++
-            $pct               = if ($totalFound -gt 0) { [math]::Round(($sync.Processed / $totalFound) * 100) } else { 0 }
-            $remainingToDelete = [math]::Max($totalFound - $sync.Processed, 0)
-            $elapsed           = ([datetime]::UtcNow - $startTime).TotalSeconds
-            $avgSec            = if ($sync.Processed -gt 0) { $elapsed / $sync.Processed } else { 0 }
-            $etaSec            = [math]::Round($avgSec * $remainingToDelete)
-            $etaStr            = if ($sync.Processed -gt 0 -and $remainingToDelete -gt 0) {
-                                     $ts = [timespan]::FromSeconds($etaSec)
-                                     if     ($ts.TotalHours -ge 1)  { "{0}h {1}m {2}s" -f [int]$ts.TotalHours, $ts.Minutes, $ts.Seconds }
-                                     elseif ($ts.TotalMinutes -ge 1) { "{0}m {1}s" -f $ts.Minutes, $ts.Seconds }
-                                     else   { "{0}s" -f $ts.Seconds }
-                                 } else { "calculating..." }
-            $status = "Deleted: $($sync.Deleted)/$totalFound  Failed: $($sync.Failed)  Remaining: ~$remainingToDelete  ETA: $etaStr"
-            Write-Progress -Activity "Deleting Threat Intelligence Indicators" `
-                           -Id $ProgressIdDeleteRun `
-                           -Status $status `
-                           -PercentComplete ([math]::Min($pct, 100))
+                $maxRetries    = 3
+                $attempt       = 0
+                $deleteSuccess = $false
+                $did401Refresh = $false
+
+                do {
+                    $attempt++
+                    try {
+                        $s.DeleteSubmitted++
+                        Invoke-RestMethod -Uri $deleteUri -Headers $hdrs -Method DELETE -ErrorAction Stop | Out-Null
+                        $s.Deleted++
+                        $deleteSuccess = $true
+                    }
+                    catch {
+                        $sc = if ($_.Exception.Response) { $_.Exception.Response.StatusCode.value__ } else { 0 }
+
+                        if ($sc -eq 401 -and -not $did401Refresh) {
+                            try {
+                                $tokenObj = Get-AzAccessToken -ResourceUrl "https://management.azure.com/" -ErrorAction Stop
+                                $newToken = if ($tokenObj.Token -is [System.Security.SecureString]) {
+                                    [System.Net.NetworkCredential]::new("", $tokenObj.Token).Password
+                                } else {
+                                    $tokenObj.Token
+                                }
+                                if ($newToken) {
+                                    $hdrs["Authorization"] = "Bearer $newToken"
+                                    $did401Refresh = $true
+                                    Write-Warning "  401 Unauthorized - token refreshed, retrying..."
+                                    $attempt--
+                                    continue
+                                }
+                            } catch {}
+                        }
+
+                        if ($sc -eq 429 -and $attempt -lt $maxRetries) {
+                            $s.Retry429++
+                            $retryInfo = & $getRetryAfter $_
+                            $rawText = if ($retryInfo.Raw) { "'$($retryInfo.Raw)'" } else { "(missing)" }
+                            $resumeUtc = $retryInfo.ResumeAtUtc.ToString("yyyy-MM-dd HH:mm:ss 'UTC'")
+                            Write-Warning "  429 Too Many Requests — raw Retry-After=$rawText; interpreted wait=$($retryInfo.Seconds)s; resume ~$resumeUtc (attempt $attempt/$maxRetries)..."
+                            Start-Sleep -Seconds $retryInfo.Seconds
+                        }
+                        else {
+                            $errDetail = ""
+                            try { $errDetail = [System.IO.StreamReader]::new($_.Exception.Response.GetResponseStream()).ReadToEnd() } catch {}
+                            $sd = if ($_.Exception.Response) { $_.Exception.Response.StatusCode.ToString() } else { $_.Exception.Message }
+                            $d  = if ($errDetail) { $errDetail } elseif ($_.Exception.Message) { $_.Exception.Message } else { "" }
+                            $s.Failed++
+                            $bag.Add($name)
+                            Write-Warning "  FAILED [$sc $sd] $name$(if ($d) { " — $d" })"
+                            $deleteSuccess = $true
+                        }
+                    }
+                } while (-not $deleteSuccess)
+
+                $s.Processed++
+            }
+
+                $retry429AfterChunk = $sync.Retry429
+                $chunk429 = $retry429AfterChunk - $retry429BeforeChunk
+                if ($chunk429 -gt 0) {
+                    # If the current burst produced 429s, reduce chunk size and add cooldown.
+                    $parallelChunkSize = [math]::Max([int][math]::Floor($parallelChunkSize / 2), $parallelChunkMin)
+                    $cooldownMs = [math]::Min((300 * $chunk429), 3000)
+                    Start-Sleep -Milliseconds $cooldownMs
+                }
+                elseif ($parallelChunkSize -lt $parallelChunkMax) {
+                    # Slowly scale up when no rate limiting is observed.
+                    $parallelChunkSize = [math]::Min(($parallelChunkSize + $ThrottleLimit), $parallelChunkMax)
+                    Start-Sleep -Milliseconds $parallelInterChunkDelayMs
+                }
+
+                Write-DeleteProgress -Force
+                $offset += $chunkLen
+            }
         }
-    }
+        else {
+                foreach ($indicator in @($batch)) {
+                $name      = $indicator.name
+                $deleteUri = "$deleteBase/$name`?api-version=$apiVersion"
 
-    Write-Progress -Activity "Deleting Threat Intelligence Indicators" -Id $ProgressIdDeleteRun -Completed
-    Write-Progress -Activity "Collecting Threat Intelligence Indicators" -Id $ProgressIdListCollect -Completed
-    Write-Progress -Activity "Collecting Indicators For Deletion" -Id $ProgressIdDeleteCollect -Completed
+                $maxRetries    = 3
+                $attempt       = 0
+                $deleteSuccess = $false
+                $did401Refresh = $false
+
+                do {
+                    $attempt++
+                    try {
+                        $sync.DeleteSubmitted++
+                        Invoke-RestMethod -Uri $deleteUri -Headers $headers -Method DELETE -ErrorAction Stop | Out-Null
+                        $sync.Deleted++
+                        $deleteSuccess = $true
+                    }
+                    catch {
+                        $errorDetail = ""
+                        try {
+                            $reader      = [System.IO.StreamReader]::new($_.Exception.Response.GetResponseStream())
+                            $errorDetail = $reader.ReadToEnd()
+                        } catch {}
+
+                        $statusCode = if ($_.Exception.Response) { $_.Exception.Response.StatusCode.value__ } else { 0 }
+
+                        if ($statusCode -eq 401 -and -not $did401Refresh) {
+                            Write-Output "  INFO: Token expired, refreshing..."
+                            $newToken = Get-BearerToken
+                            if ($newToken) {
+                                $headers["Authorization"] = "Bearer $newToken"
+                                $did401Refresh = $true
+                                $attempt--
+                                continue
+                            } else {
+                                $errorDetail   = "Could not refresh access token."
+                                $deleteSuccess = $true
+                            }
+                        }
+                        elseif ($statusCode -eq 429 -and $attempt -lt $maxRetries) {
+                            $sync.Retry429++
+                            $retryAfter = 10
+                            $retryAfterRaw = $null
+                            try {
+                                $raHeader = $_.Exception.Response.Headers.GetValues("Retry-After") | Select-Object -First 1
+                                $retryAfterRaw = $raHeader
+                                if ($raHeader) {
+                                    $parsedSeconds = 0
+                                    if ([int]::TryParse([string]$raHeader, [ref]$parsedSeconds)) {
+                                        $retryAfter = [math]::Max($parsedSeconds, 1)
+                                    }
+                                    else {
+                                        $retryAt = [datetimeoffset]::MinValue
+                                        if ([datetimeoffset]::TryParse([string]$raHeader, [ref]$retryAt)) {
+                                            $delta = [math]::Ceiling(($retryAt - [datetimeoffset]::UtcNow).TotalSeconds)
+                                            $retryAfter = [math]::Max($delta, 1)
+                                        }
+                                    }
+                                }
+                            } catch {}
+                            $ts = Get-Date -Format 'HH:mm:ss'
+                            if (-not $printedRateLimitHeaders -and $_.Exception.Response) {
+                                try {
+                                    $respHeaders = $_.Exception.Response.Headers
+                                    $headerKeys = @(
+                                        "x-ms-ratelimit-remaining-subscription-writes",
+                                        "x-ms-ratelimit-remaining-subscription-resource-requests",
+                                        "x-ms-ratelimit-remaining-tenant-writes",
+                                        "x-ms-ratelimit-remaining-tenant-resource-requests",
+                                        "x-ms-request-id",
+                                        "x-ms-correlation-request-id"
+                                    )
+                                    $headerParts = @()
+                                    foreach ($headerKey in $headerKeys) {
+                                        try {
+                                            $headerValue = $respHeaders.GetValues($headerKey) | Select-Object -First 1
+                                            if ($headerValue) { $headerParts += "$headerKey=$headerValue" }
+                                        } catch {}
+                                    }
+                                    if ($headerParts.Count -gt 0) {
+                                        Write-Output "[$ts] 429 headers: $($headerParts -join ' | ')"
+                                        $printedRateLimitHeaders = $true
+                                    }
+                                } catch {}
+                            }
+                            $resumeUtc = ([datetime]::UtcNow).AddSeconds($retryAfter).ToString("yyyy-MM-dd HH:mm:ss 'UTC'")
+                            $rawText = if ($retryAfterRaw) { "'$retryAfterRaw'" } else { "(missing)" }
+                            Write-Output "[$ts] Rate limited (429) — raw Retry-After=$rawText; interpreted wait=${retryAfter}s; resume ~$resumeUtc (attempt $attempt/$maxRetries)..."
+                            Start-Sleep -Seconds $retryAfter
+                        }
+                        else {
+                            $sync.Failed++
+                            $failedBag.Add($name)
+                            $statusDesc = if ($_.Exception.Response) { $_.Exception.Response.StatusCode.ToString() } else { $_.Exception.Message }
+                            $detail     = if ($errorDetail) { $errorDetail } elseif ($_.Exception.Message) { $_.Exception.Message } else { "" }
+                            Write-Output "  FAILED [$statusCode $statusDesc] $name$(if ($detail) { " — $detail" })"
+                            $deleteSuccess = $true
+                        }
+                    }
+                } while (-not $deleteSuccess)
+
+                $sync.Processed++
+                # Proactive per-request throttle — paces DELETE calls to avoid 429 bursts
+                Start-Sleep -Milliseconds 250
+                Write-DeleteProgress
+                }
+        }
+
+        if ($sync.Processed -le $processedBeforeBatch) {
+            if ($fetchState.UseClientSideSourceFilter -and (($fetchState.UseListGetFallback -and $fetchState.ListNextPageUri) -or ((-not $fetchState.UseListGetFallback) -and $fetchState.ScanPageUri))) {
+                continue
+            }
+            Write-Output "WARNING: No indicators were processed in this delete batch; stopping to avoid loop."
+            break
+        }
+
+        if ($RecountAfterBatch) {
+            $sync.CountSubmitted++
+            $remainingCount = Get-IndicatorTotalCount -Headers $headers `
+                                                    -SubscriptionId $SubscriptionId `
+                                                    -ResourceGroupName $ResourceGroupName `
+                                                    -WorkspaceName $WorkspaceName `
+                                                    -Source $SourceFilter
+            if ($null -ne $remainingCount) {
+                $totalFound = $sync.Processed + [int64]$remainingCount
+                $countIsExact = $true
+                $ts = Get-Date -Format 'HH:mm:ss'
+                Write-Output "[$ts] Recount: Remaining=$remainingCount | ReconciledTotal=$totalFound"
+                if ($remainingCount -eq 0) {
+                    break
+                }
+            }
+        }
+        
+        # Delay between batches to avoid rate limiting
+        Start-Sleep -Milliseconds 1000
+    }
 
     $deleted   = $sync.Deleted
     $failed    = $sync.Failed
@@ -591,11 +1285,78 @@ function Remove-SentinelThreatIndicator {
                     else                                       { "{0}s" -f $totalElapsed.Seconds }
     Write-Output ""
     Write-Output "===== Summary ====="
-    Write-Output "Source filter : $(if ($SourceFilter) { $SourceFilter } else { "(all sources)" })"
-    Write-Output "Total found   : $totalFound"
+    Write-Output "Source filter : $(if ($SourceFilter) { $SourceFilter -join ', ' } else { "(all sources)" })"
+    Write-Output "Total found   : $(if ($countIsExact) { "$totalFound" } else { ">=$totalFound (count incomplete)" })"
     Write-Output "Deleted       : $deleted"
     Write-Output "Failed        : $failed"
+    Write-Output "Delete reqs   : $($sync.DeleteSubmitted)"
+    Write-Output "Query reqs    : $($sync.QuerySubmitted)"
+    Write-Output "Count reqs    : $($sync.CountSubmitted)"
+    Write-Output "429 retries   : $($sync.Retry429)"
+    Write-Output "Total reqs    : $($sync.DeleteSubmitted + $sync.QuerySubmitted + $sync.CountSubmitted)"
     Write-Output "Elapsed time  : $elapsedStr"
+
+    $processedTotal = $deleted + $failed
+    $countDelta = $totalFound - $processedTotal
+    if ($countDelta -ne 0) {
+        if ($processedTotal -eq 0 -and $fetchBatchFailed) {
+            Write-Warning "Deletion run ended before any items were processed due to query failure. Skipping count reconciliation warning."
+            if ($fetchBatchErrorText) {
+                Write-Output "Last query error: $fetchBatchErrorText"
+            }
+            Write-Log "Count reconciliation skipped | Found: $totalFound | Processed: 0 | Reason: initial query failed"
+            $countDelta = 0
+        }
+    }
+
+    if ($countDelta -ne 0) {
+        # Recount remaining indicators to verify whether mismatch is drift vs. an inaccurate initial count.
+        $remainingNow   = 0
+        $recountFailed  = $false
+        $recountPageUri = $queryUri
+        $seenRecountLink = [System.Collections.Generic.HashSet[string]]::new()
+        do {
+            try {
+                $sync.QuerySubmitted++
+                $recountResult = Get-IndicatorPage -Headers $headers -Uri $recountPageUri -Source $SourceFilter -Size $PageSize -SkipToken $null
+                $remainingNow += if ($recountResult.Items) { @($recountResult.Items).Count } else { 0 }
+                $recountPageUri = $recountResult.NextLink
+                if ($recountPageUri -and (-not $seenRecountLink.Add($recountPageUri))) {
+                    Write-Output "WARNING: Duplicate pagination link received during recount; stopping to prevent loop."
+                    break
+                }
+            }
+            catch {
+                $recountFailed = $true
+                break
+            }
+        } while ($recountPageUri)
+
+        if (-not $recountFailed) {
+            $reconciledFound = $processedTotal + $remainingNow
+            $reconciledDelta = $totalFound - $reconciledFound
+            $looksLikeUnfilteredCount = $false
+            if ($countIsExact -and $SourceFilter -and $SourceFilter.Count -gt 0) {
+                $threshold = [math]::Max(100, [int][math]::Ceiling($reconciledFound * 0.05))
+                $looksLikeUnfilteredCount = ([math]::Abs($reconciledDelta) -gt $threshold)
+            }
+
+            if ($looksLikeUnfilteredCount) {
+                Write-Warning "Initial count API result appears inaccurate for source filter. API Found=$totalFound, Reconciled Found=$reconciledFound (Processed=$processedTotal, Remaining=$remainingNow)."
+                Write-Output "Reconciled total : $reconciledFound"
+            }
+            else {
+                Write-Warning "Count reconciliation mismatch detected. Found=$totalFound, Processed=$processedTotal (Delta=$countDelta). This can happen when indicators change during the run."
+            }
+            Write-Output "Remaining now : $remainingNow"
+            Write-Log "Count reconciliation | Found: $totalFound | Processed: $processedTotal | Delta: $countDelta | RemainingNow: $remainingNow"
+        }
+        else {
+            Write-Warning "Count reconciliation mismatch detected. Found=$totalFound, Processed=$processedTotal (Delta=$countDelta). Recount failed."
+            Write-Log "Count reconciliation | Found: $totalFound | Processed: $processedTotal | Delta: $countDelta | RemainingNow: (recount failed)"
+        }
+    }
+
     if ($failedIds.Count -gt 0) {
         Write-Output ""
         Write-Output "Failed indicators:"
