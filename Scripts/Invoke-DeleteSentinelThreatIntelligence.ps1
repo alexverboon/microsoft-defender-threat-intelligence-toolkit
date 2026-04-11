@@ -1,5 +1,5 @@
 #region --- CONFIGURATION - Edit these values ---
-$SubscriptionId    = "00000000-0000-0000-0000-000000000000"  # Subscription ID of the Sentinel workspace
+$SubscriptionId    = ""  # Subscription ID of the Sentinel workspace
 $ResourceGroupName = "rg_sentinel01"
 $WorkspaceName     = "AVSentinel01"
 $BatchSize         = 1000
