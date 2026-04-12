@@ -10,13 +10,24 @@ function Remove-SentinelThreatIndicators {
     .PARAMETER WorkspaceName
         Log Analytics workspace name linked to Microsoft Sentinel.
     .PARAMETER SourceFilter
-        Filter indicators by one or more source names. Leave empty to target all sources.
-    .PARAMETER PageSize
+        Filter indicators by one or more source names.
+        At least one non-empty source value is required; empty input is rejected for safety.
+        One or more sources, for example:
+        @("ThreatViewIPBlockList","ThreatViewURLBlockList") 
+    .PARAMETER BatchSize
         Number of indicators to retrieve per API page. Defaults to 100.
     .PARAMETER ConcurrentWorkers
-        Maximum concurrent DELETE workers. Requires PowerShell 7+; ignored on PS 5.
+        Maximum concurrent DELETE workers.
+        Default is 1 (sequential mode).
+        Values greater than 1 enable parallel deletes on PowerShell 7+.
+        This controls concurrency, while TargetDeleteRatePerSecond controls sustained throughput.
+        Higher worker counts can improve throughput on high-latency runs but may increase burst
+        pressure and throttling (HTTP 429).
     .PARAMETER TargetDeleteRatePerSecond
-        Sustained DELETE request rate across the whole run. Use values like 0.25 to stay below ARM write limits.
+        Sustained DELETE request rate across the whole run.
+        Start with 1.0 req/s as a safe baseline (~3600/hour).
+        Higher values (for example 10.0 req/s) can speed up overall processing but increase
+        the chance of throttling (HTTP 429), depending on tenant and subscription limits.
     .PARAMETER LogFile
         Path to the log file. Defaults to Remove-SentinelThreatIndicators.log in the script's folder.
     .PARAMETER ProgressRefreshIntervalSeconds
@@ -29,12 +40,13 @@ function Remove-SentinelThreatIndicators {
         [string]$ResourceGroupName,
         [string]$WorkspaceName,
         [string[]]$SourceFilter,
-        [int]$PageSize,
-        [int]$ConcurrentWorkers,
-        [double]$TargetDeleteRatePerSecond = 0.25,
+        [Alias('PageSize')]
+        [int]$BatchSize = 100,
+        [int]$ConcurrentWorkers = 1,
+        [double]$TargetDeleteRatePerSecond = 1.0,
         [string]$LogFile = "",
         [int]$ProgressRefreshIntervalSeconds = 60,
-        [switch]$ShowAPIWarnings
+        [switch]$ShowAPIWarnings = $false
     )
 
     # Validate required parameters
@@ -44,6 +56,28 @@ function Remove-SentinelThreatIndicators {
     if ([string]::IsNullOrWhiteSpace($WorkspaceName))     { $configErrors += "  - WorkspaceName is empty." }
     if ($configErrors.Count -gt 0) {
         Write-Error "One or more required parameters are missing:`n$($configErrors -join "`n")"
+        return
+    }
+
+    if ($PSVersionTable.PSVersion.Major -lt 7) {
+        Write-Error "PowerShell 7.0 or later is required. Current version: $($PSVersionTable.PSVersion)"
+        return
+    }
+
+    if ($null -ne $SourceFilter) {
+        # Normalize source filter input: drop null/empty items and trim whitespace.
+        $normalizedSourceFilter = @(
+            $SourceFilter |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                ForEach-Object { $_.Trim() } |
+                Where-Object { $_.Length -gt 0 } |
+                Select-Object -Unique
+        )
+        $SourceFilter = if ($normalizedSourceFilter.Count -gt 0) { $normalizedSourceFilter } else { $null }
+    }
+
+    if (-not $SourceFilter -or $SourceFilter.Count -eq 0) {
+        Write-Error "SourceFilter is required for safety. Specify at least one non-empty source value."
         return
     }
 
@@ -64,29 +98,18 @@ function Remove-SentinelThreatIndicators {
         $LogFile = Join-Path $logDir "Remove-SentinelThreatIndicators_$logDate.log"
     }
 
+    $logFileDisplay = "/logs/" + ([regex]::Replace($LogFile, '.*[\\/]Logs[\\/]', '') -replace '\\', '/')
+
     $RunId = Get-Random -Minimum 10000000 -Maximum 99999999
 
-    function Write-Log {
-        param([System.Collections.Specialized.OrderedDictionary]$Fields)
-        $level = if ($Fields.Contains('level')) { $Fields['level'] } else { 'info' }
-        $ts    = [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
-        $pairs = [System.Collections.Generic.List[string]]::new()
-        $pairs.Add("ts=$ts")
-        $pairs.Add("level=$level")
-        $pairs.Add("run_id=$RunId")
-        foreach ($key in $Fields.Keys) {
-            if ($key -eq 'level') { continue }
-            $val = $Fields[$key]
-            if ($null -eq $val) { $val = 'null' }
-            # Quote values that contain spaces, = or "
-            if ($val -match '[ =""]') { $val = '"' + ($val -replace '"', '\"') + '"' }
-            $pairs.Add("$key=$val")
-        }
-        ($pairs -join ' ') | Out-File -FilePath $LogFile -Append -Encoding utf8 -Confirm:$false
+    $loggerScriptPath = Join-Path $PSScriptRoot "Common\Toolkit.Logging.ps1"
+    if (-not (Test-Path -Path $loggerScriptPath -PathType Leaf)) {
+        Write-Error "Required logging helper script not found: $loggerScriptPath"
+        return
     }
+    . $loggerScriptPath
+    Initialize-ToolkitLogger -LogFile $LogFile -RunId $RunId
 
-    Write-Output "Log file: $LogFile"
-    Write-Output "Run ID: $RunId"
     Write-Log ([ordered]@{ event = 'run_started'; subscription_id = $SubscriptionId; resource_group = $ResourceGroupName; workspace = $WorkspaceName; source_filter = $(if ($SourceFilter) { $SourceFilter -join ', ' } else { '(all sources)' }) })
 
     $toolkitVersion = '1.0.0'
@@ -99,16 +122,16 @@ function Remove-SentinelThreatIndicators {
         }
     }
 
-    if (-not $PageSize -or $PageSize -lt 1) {
-        $PageSize = 100
+    if (-not $BatchSize -or $BatchSize -lt 1) {
+        $BatchSize = 100
     }
 
-    if (-not $ConcurrentWorkers -or $ConcurrentWorkers -lt 1) {
+    if ($ConcurrentWorkers -lt 1) {
         $ConcurrentWorkers = 1
     }
 
     if (-not $TargetDeleteRatePerSecond -or $TargetDeleteRatePerSecond -le 0) {
-        $TargetDeleteRatePerSecond = 0.25
+        $TargetDeleteRatePerSecond = 1.0
     }
 
     if (-not $ProgressRefreshIntervalSeconds -or $ProgressRefreshIntervalSeconds -lt 5) {
@@ -420,9 +443,9 @@ function Remove-SentinelThreatIndicators {
     $countUri   = "$baseUri/threatIntelligence/main/count?api-version=2025-07-01-preview"
     $queryUri   = "$baseUri/threatIntelligence/main/queryIndicators?api-version=$apiVersion"
     $deleteBase = "$baseUri/threatIntelligence/main/indicators"
-    $script:QueryBodyMode = $null
-    $script:QueryApiVersion = $apiVersion
-    $script:ListApiVersion = $apiVersion
+    # Marker: query compatibility fallbacks are intentionally disabled.
+    # If tenant-specific query 400 behavior returns, restore logic from local recovery notes.
+    $QueryCompatibilityFallbackEnabled = $false
 
     function Resolve-AbsoluteApiUri {
         param([string]$CandidateUri)
@@ -445,165 +468,27 @@ function Remove-SentinelThreatIndicators {
             [int]$Size,
             [string]$SkipToken
         )
+        $requestUri = Resolve-AbsoluteApiUri -CandidateUri $Uri
+        $body = [ordered]@{ pageSize = $Size }
+        $body.sortBy = @(@{ itemKey = "lastUpdatedTimeUtc"; sortOrder = "descending" })
+        if ($Source) { $body.sources = @($Source) }
+        if ($SkipToken) { $body.skipToken = $SkipToken }
 
-        function New-QueryBody {
-            param(
-                [int]$PageSize,
-                [string[]]$SourceNames,
-                [string]$Token,
-                [ValidateSet("legacy", "legacy-pascal", "legacy-no-sort", "sort-single", "sort-single-pascal", "singular-source", "source-string", "condition")]
-                [string]$Mode
-            )
-
-            $body = [ordered]@{ pageSize = $PageSize }
-
-            switch ($Mode) {
-                "legacy" {
-                    $body.sortBy = @(@{ itemKey = "lastUpdatedTimeUtc"; sortOrder = "descending" })
-                    if ($SourceNames) { $body.sources = @($SourceNames) }
-                }
-                "legacy-pascal" {
-                    $body.sortBy = @(@{ itemKey = "LastUpdatedTimeUtc"; sortOrder = "Descending" })
-                    if ($SourceNames) { $body.sources = @($SourceNames) }
-                }
-                "legacy-no-sort" {
-                    if ($SourceNames) { $body.sources = @($SourceNames) }
-                }
-                "sort-single" {
-                    $body.sortBy = @{ itemKey = "lastUpdatedTimeUtc"; sortOrder = "descending" }
-                    if ($SourceNames) { $body.sources = @($SourceNames) }
-                }
-                "sort-single-pascal" {
-                    $body.sortBy = @{ itemKey = "LastUpdatedTimeUtc"; sortOrder = "Descending" }
-                    if ($SourceNames) { $body.sources = @($SourceNames) }
-                }
-                "singular-source" {
-                    if ($SourceNames) { $body.source = @($SourceNames) }
-                }
-                "source-string" {
-                    if ($SourceNames -and $SourceNames.Count -gt 0) { $body.source = [string]$SourceNames[0] }
-                }
-                "condition" {
-                    if ($SourceNames -and $SourceNames.Count -gt 0) {
-                        $clauses = @()
-                        foreach ($src in $SourceNames) {
-                            $clauses += @{
-                                field    = "source"
-                                operator = "Equals"
-                                values   = @("$src")
-                            }
-                        }
-                        $body.condition = @{
-                            conditionConnective = "Or"
-                            clauses             = $clauses
-                        }
-                    }
-                }
-            }
-
-            if ($Token) { $body.skipToken = $Token }
-            return $body
+        $response = $null
+        try {
+            $response = Invoke-SentinelRestMethod -Uri $requestUri `
+                                                 -Headers $Headers `
+                                                 -Method POST `
+                                                 -Body $body `
+                                                 -OperationName "Query indicators"
         }
-
-        $effectiveSize = $Size
-        while ($true) {
-            $allModes = @("legacy", "legacy-pascal", "legacy-no-sort", "sort-single", "sort-single-pascal", "singular-source", "source-string", "condition")
-            $probeModes = if ($script:QueryBodyMode) {
-                @($script:QueryBodyMode) + @($allModes | Where-Object { $_ -ne $script:QueryBodyMode })
+        catch {
+            $statusCode = Get-HttpStatusCode -ErrorRecord $_
+            if ($statusCode -eq 400 -and -not $QueryCompatibilityFallbackEnabled) {
+                Write-Warning "Query endpoint returned 400 and compatibility fallback is disabled by design."
+                Write-Log ([ordered]@{ level = 'warn'; event = 'query_fallback_disabled'; status_code = 400; operation = 'Query indicators'; note = 'compatibility fallback intentionally disabled' })
             }
-            else {
-                $allModes
-            }
-
-            $response = $null
-            $usedMode = $null
-            $lastError = $null
-
-            foreach ($mode in $probeModes) {
-                $body = New-QueryBody -PageSize $effectiveSize -SourceNames $Source -Token $SkipToken -Mode $mode
-
-                $requestUri = Resolve-AbsoluteApiUri -CandidateUri $Uri
-
-                try {
-                    $response = Invoke-SentinelRestMethod -Uri $requestUri `
-                                                         -Headers $Headers `
-                                                         -Method POST `
-                                                         -Body $body `
-                                                         -OperationName "Query indicators"
-                    $usedMode = $mode
-                    break
-                }
-                catch {
-                    $lastError = $_
-                    $statusCode = Get-HttpStatusCode -ErrorRecord $_
-
-                    # On 400, try other payload schema variants before failing.
-                    if ($statusCode -eq 400 -and $probeModes.Count -gt 1) {
-                        continue
-                    }
-
-                    throw
-                }
-            }
-
-            if (-not $response) {
-                $statusCode = 0
-                if ($lastError) {
-                    $statusCode = Get-HttpStatusCode -ErrorRecord $lastError
-
-                    if ($statusCode -eq 400 -and $effectiveSize -gt 100) {
-                        $nextSize = [math]::Max([int][math]::Floor($effectiveSize / 2), 100)
-                        if ($nextSize -lt $effectiveSize) {
-                            Write-Output "INFO: API rejected page size $effectiveSize (400). Retrying with $nextSize."
-                            $effectiveSize = $nextSize
-                            continue
-                        }
-                    }
-
-                    if ($statusCode -eq 400) {
-                        $versionCandidates = @()
-                        foreach ($candidate in @("2025-09-01", "2025-07-01-preview", "2024-09-01-preview")) {
-                            if ($candidate -and ($candidate -ne $script:QueryApiVersion)) { $versionCandidates += $candidate }
-                        }
-
-                        foreach ($candidateVersion in $versionCandidates) {
-                            $candidateUri = if ($Uri -match '([?&])api-version=[^&]+') {
-                                [regex]::Replace($Uri, '([?&])api-version=[^&]+', "`$1api-version=$candidateVersion")
-                            }
-                            else {
-                                "$Uri$(if ($Uri -match '\?') { '&' } else { '?' })api-version=$candidateVersion"
-                            }
-
-                            try {
-                                $candidateBody = New-QueryBody -PageSize $effectiveSize -SourceNames $Source -Token $SkipToken -Mode "legacy-no-sort"
-                                $candidateResponse = Invoke-SentinelRestMethod -Uri $candidateUri `
-                                                                              -Headers $Headers `
-                                                                              -Method POST `
-                                                                              -Body $candidateBody `
-                                                                              -OperationName "Query indicators"
-                                $script:QueryApiVersion = $candidateVersion
-                                $response = $candidateResponse
-                                $usedMode = "legacy-no-sort"
-                                Write-Output "INFO: Using query API version '$candidateVersion'."
-                                break
-                            }
-                            catch {}
-                        }
-
-                        if ($response) { break }
-                    }
-
-                    throw $lastError
-                }
-                throw "Query request failed for unknown reason."
-            }
-
-            if (-not $script:QueryBodyMode) {
-                $script:QueryBodyMode = $usedMode
-                Write-Output "INFO: Using query payload mode '$usedMode'."
-            }
-
-            break
+            throw
         }
 
         $nextLink = $null
@@ -632,7 +517,7 @@ function Remove-SentinelThreatIndicators {
         [PSCustomObject]@{
             Items         = $items
             NextLink      = $nextLink
-            EffectiveSize = $effectiveSize
+            EffectiveSize = $Size
         }
     }
 
@@ -709,71 +594,6 @@ function Remove-SentinelThreatIndicators {
         return $null
     }
 
-    function Get-IndicatorPageList {
-        <#
-        .SYNOPSIS
-            Lists indicators using GET endpoint as a fallback when queryIndicators POST is rejected.
-        #>
-        param(
-            [hashtable]$Headers,
-            [string]$Uri,
-            [int]$Size
-        )
-
-        $requestUri = $Uri
-        if (-not $requestUri) {
-            # Some tenants reject $top on this endpoint with HTTP 400; rely on server paging via nextLink.
-            $requestUri = "$deleteBase?api-version=$($script:ListApiVersion)"
-        }
-        $requestUri = Resolve-AbsoluteApiUri -CandidateUri $requestUri
-
-        $response = $null
-        try {
-            $response = Invoke-SentinelRestMethod -Uri $requestUri -Headers $Headers -Method GET -OperationName "List indicators"
-        }
-        catch {
-            $statusCode = Get-HttpStatusCode -ErrorRecord $_
-
-            if ($statusCode -eq 400) {
-                foreach ($candidateVersion in @("2025-09-01", "2025-07-01-preview", "2024-09-01-preview")) {
-                    if ($candidateVersion -eq $script:ListApiVersion) { continue }
-                    $candidateUri = if ($requestUri -match '([?&])api-version=[^&]+') {
-                        [regex]::Replace($requestUri, '([?&])api-version=[^&]+', "`$1api-version=$candidateVersion")
-                    }
-                    else {
-                        "$requestUri$(if ($requestUri -match '\?') { '&' } else { '?' })api-version=$candidateVersion"
-                    }
-
-                    try {
-                        $candidateUri = Resolve-AbsoluteApiUri -CandidateUri $candidateUri
-                        $response = Invoke-SentinelRestMethod -Uri $candidateUri -Headers $Headers -Method GET -OperationName "List indicators"
-                        $script:ListApiVersion = $candidateVersion
-                        Write-Output "INFO: Using list API version '$candidateVersion'."
-                        break
-                    }
-                    catch {}
-                }
-            }
-
-            if (-not $response) { throw }
-        }
-
-        $nextLink = $null
-        foreach ($linkKey in @("nextLink", "@odata.nextLink", "odata.nextLink", "nextPageLink")) {
-            $prop = $response.PSObject.Properties | Where-Object { $_.Name -ieq $linkKey } | Select-Object -First 1
-            if ($prop -and $prop.Value) {
-                $nextLink = Resolve-AbsoluteApiUri -CandidateUri ([string]$prop.Value)
-                break
-            }
-        }
-
-        [PSCustomObject]@{
-            Items         = @($response.value)
-            NextLink      = $nextLink
-            EffectiveSize = $Size
-        }
-    }
-
     function New-FetchState {
         param(
             [string]$InitialQueryUri,
@@ -781,14 +601,8 @@ function Remove-SentinelThreatIndicators {
         )
 
         return [ordered]@{
-            SourceFilter               = $Filter
-            UseClientSideSourceFilter  = $false
-            UseListGetFallback         = $false
-            ScanPageUri                = $InitialQueryUri
-            ListNextPageUri            = $null
-            SeenScanPageLink           = [System.Collections.Generic.HashSet[string]]::new()
-            SeenListPageLink           = [System.Collections.Generic.HashSet[string]]::new()
-            HadContinuation            = $false
+            SourceFilter = $Filter
+            QueryPageUri = $InitialQueryUri
         }
     }
 
@@ -804,53 +618,14 @@ function Remove-SentinelThreatIndicators {
             try {
                 if ($Sync) { $Sync.QuerySubmitted++ }
 
-                if ($State.UseClientSideSourceFilter) {
-                    if ($State.UseListGetFallback) {
-                        $pageResult = Get-IndicatorPageList -Headers $Headers -Uri $State.ListNextPageUri -Size $Size
-                    }
-                    else {
-                        $pageResult = Get-IndicatorPage -Headers $Headers -Uri $State.ScanPageUri -Source $null -Size $Size -SkipToken $null
-                    }
-
-                    $rawBatch = @($pageResult.Items)
-                    $batch = @($rawBatch | Where-Object { $State.SourceFilter -contains $_.properties.source })
-                    $batchCount = $batch.Count
-
-                    if ($State.UseListGetFallback) {
-                        $State.ListNextPageUri = $pageResult.NextLink
-                        if ($State.ListNextPageUri) {
-                            $State.HadContinuation = $true
-                            if (-not $State.SeenListPageLink.Add($State.ListNextPageUri)) {
-                                Write-Output "WARNING: Duplicate pagination link received during list fallback scan; stopping to prevent loop."
-                                $State.ListNextPageUri = $null
-                            }
-                        }
-                    }
-                    else {
-                        $State.ScanPageUri = $pageResult.NextLink
-                        if ($State.ScanPageUri) {
-                            $State.HadContinuation = $true
-                            if (-not $State.SeenScanPageLink.Add($State.ScanPageUri)) {
-                                Write-Output "WARNING: Duplicate pagination link received during client-side source filtering; stopping to prevent loop."
-                                $State.ScanPageUri = $null
-                            }
-                        }
-                    }
-                }
-                else {
-                    $pageResult = Get-IndicatorPage -Headers $Headers -Uri $queryUri -Source $State.SourceFilter -Size $Size -SkipToken $null
-                    $batch = @($pageResult.Items)
-                    $batchCount = $batch.Count
-                }
+                $pageResult = Get-IndicatorPage -Headers $Headers -Uri $State.QueryPageUri -Source $State.SourceFilter -Size $Size -SkipToken $null
+                $batch = @($pageResult.Items)
+                $batchCount = $batch.Count
+                $State.QueryPageUri = $pageResult.NextLink
 
                 $effectiveSize = $pageResult.EffectiveSize
 
                 if ($batchCount -eq 0) {
-                    if ($State.UseClientSideSourceFilter -and (($State.UseListGetFallback -and $State.ListNextPageUri) -or ((-not $State.UseListGetFallback) -and $State.ScanPageUri))) {
-                        # Current page had no matching source; continue scanning remaining pages.
-                        continue
-                    }
-
                     return [PSCustomObject]@{
                         FetchFailed    = $false
                         EndOfStream    = $true
@@ -887,26 +662,12 @@ function Remove-SentinelThreatIndicators {
 
                 $statusCode = Get-HttpStatusCode -ErrorRecord $_
 
-                if (($statusCode -eq 400) -and (-not $State.UseClientSideSourceFilter) -and $State.SourceFilter -and $State.SourceFilter.Count -gt 0) {
-                    Write-Warning "Source-filtered query rejected (400). Falling back to client-side source filtering with paged scan."
-                    $State.UseClientSideSourceFilter = $true
-                    $State.ScanPageUri = $queryUri
-                    $State.SeenScanPageLink.Clear()
-                    continue
-                }
+                $failureStage = "filtered-query"
+                $failureUri = $State.QueryPageUri
 
-                if (($statusCode -eq 400) -and $State.UseClientSideSourceFilter -and (-not $State.UseListGetFallback)) {
-                    Write-Warning "Query scan endpoint rejected (400). Falling back to indicator list GET scan."
-                    $State.UseListGetFallback = $true
-                    $State.ListNextPageUri = $null
-                    $State.SeenListPageLink.Clear()
-                    continue
+                if ($statusCode -eq 400 -and -not $QueryCompatibilityFallbackEnabled) {
+                    Write-Log ([ordered]@{ level = 'warn'; event = 'query_fallback_disabled'; status_code = 400; stage = $failureStage; note = 'compatibility fallback intentionally disabled' })
                 }
-
-                $failureStage = if (-not $State.UseClientSideSourceFilter) { "filtered-query" }
-                                elseif (-not $State.UseListGetFallback) { "client-side-query-scan" }
-                                else { "list-get-scan" }
-                $failureUri = if ($State.UseListGetFallback) { $State.ListNextPageUri } else { $State.ScanPageUri }
 
                 return [PSCustomObject]@{
                     FetchFailed    = $true
@@ -924,12 +685,6 @@ function Remove-SentinelThreatIndicators {
         }
     }
 
-    try {
-        Clear-Host
-    }
-    catch {
-    }
-
     Write-Output "==============================================================="
     Write-Output "Microsoft Sentinel - Threat Intelligence Toolkit"
     Write-Output "Version : $toolkitVersion"
@@ -940,6 +695,8 @@ function Remove-SentinelThreatIndicators {
     Write-Output "===== Preflight ====="
     Write-Log ([ordered]@{ event = 'preflight_token'; status = 'access_token_acquired' })
     Write-Status -Level PASS -Message "Access token acquired."
+    Write-Log ([ordered]@{ event = 'preflight_config'; run_id = $RunId; log_file = $logFileDisplay })
+    Write-Status -Level INFO -Message "Run ID/Log file: $RunId | $logFileDisplay"
     Write-Log ([ordered]@{ event = 'preflight_config'; subscription_id = $SubscriptionId })
     Write-Status -Level INFO -Message "Subscription ID: $SubscriptionId"
     Write-Log ([ordered]@{ event = 'preflight_config'; resource_group = $ResourceGroupName })
@@ -1082,7 +839,7 @@ function Remove-SentinelThreatIndicators {
         $etaSec = if ($rate -gt 0) { [math]::Round($remaining / $rate) } else { 0 }
         $etaStr = if ($remaining -gt 0) {
             if ($etaSec -ge 3600)  { "{0}h {1}m" -f [int]($etaSec/3600), [int](($etaSec%3600)/60) }
-            elseif ($etaSec -ge 60) { "{0}m {1}s" -f [int]($etaSec/60), $etaSec%60 }
+            elseif ($etaSec -ge 60) { "{0}m {1}s" -f [int]($etaSec / 60), [int]($etaSec % 60) }
             else { "{0}s" -f $etaSec }
         } else { "Done" }
         $percentComplete = if ($totalFound -gt 0) {
@@ -1122,7 +879,7 @@ function Remove-SentinelThreatIndicators {
             }
         }
 
-        $fetchResult = Get-ResilientIndicatorBatch -Headers $headers -State $fetchState -Size $PageSize -Sync $sync
+        $fetchResult = Get-ResilientIndicatorBatch -Headers $headers -State $fetchState -Size $BatchSize -Sync $sync
         if ($fetchResult.FetchFailed) {
             $stage = if ($fetchResult.FailureStage) { [string]$fetchResult.FailureStage } else { "unknown" }
             $activeUri = if ($fetchResult.FailureUri) { [string]$fetchResult.FailureUri } else { $null }
@@ -1133,7 +890,7 @@ function Remove-SentinelThreatIndicators {
             }
             $failureStatus = 0
             try { $failureStatus = [int]$fetchResult.FailureStatusCode } catch {}
-            Write-Output "INFO: Fetch diagnostic | Stage=$stage | Status=$failureStatus | QueryMode=$script:QueryBodyMode | QueryApiVersion=$script:QueryApiVersion | ListApiVersion=$script:ListApiVersion | PageSize=$PageSize | Processed=$($sync.Processed) | Uri=$uriPreview"
+            Write-Output "INFO: Fetch diagnostic | Stage=$stage | Status=$failureStatus | QueryApiVersion=$apiVersion | BatchSize=$BatchSize | Processed=$($sync.Processed) | Uri=$uriPreview"
 
             # Probe remaining count to distinguish endpoint instability from true remaining workload.
             $sync.CountSubmitted++
@@ -1154,11 +911,11 @@ function Remove-SentinelThreatIndicators {
             }
 
             if ($fetchRetryCount -lt $fetchRetryMaxAttempts) {
-                if ($failureStatus -eq 400 -and $PageSize -gt 10) {
-                    $newPageSize = if ($PageSize -gt 50) { 50 } elseif ($PageSize -gt 25) { 25 } else { 10 }
-                    if ($newPageSize -lt $PageSize) {
-                        Write-Warning "Reducing page size from $PageSize to $newPageSize after fetch failure to improve endpoint compatibility."
-                        $PageSize = $newPageSize
+                if ($failureStatus -eq 400 -and $BatchSize -gt 10) {
+                    $newBatchSize = if ($BatchSize -gt 50) { 50 } elseif ($BatchSize -gt 25) { 25 } else { 10 }
+                    if ($newBatchSize -lt $BatchSize) {
+                        Write-Warning "Reducing batch size from $BatchSize to $newBatchSize after fetch failure to improve endpoint compatibility."
+                        $BatchSize = $newBatchSize
                     }
                 }
                 $delaySec = $fetchRetryDelaysSec[$fetchRetryCount]
@@ -1171,11 +928,7 @@ function Remove-SentinelThreatIndicators {
                 # Refresh the token in case the prior failures were auth-related.
                 $freshToken = Get-BearerToken
                 if ($freshToken) { $headers["Authorization"] = "Bearer $freshToken" }
-                # Clear the cached query-body mode so the full payload-mode probe runs fresh.
-                $script:QueryBodyMode   = $null
-                $script:QueryApiVersion = $apiVersion
-                $script:ListApiVersion  = $apiVersion
-                # Reset the fetch state so all fallback paths are re-attempted from scratch.
+                # Reset the fetch state and restart from the first query page.
                 $fetchState = New-FetchState -InitialQueryUri $queryUri -Filter $SourceFilter
                 continue
             }
@@ -1196,7 +949,7 @@ function Remove-SentinelThreatIndicators {
 
         $batch      = $fetchResult.Batch
         $batchCount = $fetchResult.BatchCount
-        $PageSize   = $fetchResult.EffectiveSize
+        $BatchSize   = $fetchResult.EffectiveSize
 
         $processedBeforeBatch = $sync.Processed
 
@@ -1509,26 +1262,12 @@ function Remove-SentinelThreatIndicators {
         }
 
         if ($sync.Processed -le $processedBeforeBatch) {
-            if ($fetchState.UseClientSideSourceFilter -and (($fetchState.UseListGetFallback -and $fetchState.ListNextPageUri) -or ((-not $fetchState.UseListGetFallback) -and $fetchState.ScanPageUri))) {
-                continue
-            }
             Write-Output "WARNING: No indicators were processed in this delete batch; stopping to avoid loop."
             break
         }
 
-        # Deletions mutate the dataset, which can invalidate continuation links.
-        # In fallback scan modes, restart from the first page each batch to avoid stale-token 400s.
-        if ($fetchState.UseClientSideSourceFilter) {
-            if ($fetchState.UseListGetFallback) {
-                $fetchState.ListNextPageUri = $null
-                $fetchState.SeenListPageLink.Clear()
-            }
-            else {
-                $fetchState.ScanPageUri = $queryUri
-                $fetchState.SeenScanPageLink.Clear()
-            }
-            $fetchState.HadContinuation = $false
-        }
+        # Deletions mutate the dataset, so restart query from the first page each batch.
+        $fetchState = New-FetchState -InitialQueryUri $queryUri -Filter $SourceFilter
 
         # Delay between batches to avoid rate limiting
         Start-Sleep -Milliseconds 1000
@@ -1544,18 +1283,23 @@ function Remove-SentinelThreatIndicators {
     $elapsedStr   = if     ($totalElapsed.TotalHours -ge 1)  { "{0}h {1}m {2}s" -f [int]$totalElapsed.TotalHours, $totalElapsed.Minutes, $totalElapsed.Seconds }
                     elseif ($totalElapsed.TotalMinutes -ge 1) { "{0}m {1}s" -f $totalElapsed.Minutes, $totalElapsed.Seconds }
                     else                                       { "{0}s" -f $totalElapsed.Seconds }
+    $summaryLevel = if ($failed -gt 0) { 'WARN' } else { 'PASS' }
+    $executionMode = if ($useParallel) { 'parallel' } else { 'sequential' }
+    $totalRequests = ($sync.DeleteSubmitted + $sync.QuerySubmitted + $sync.CountSubmitted)
+
     Write-Output ""
     Write-Output "===== Summary ====="
+    Write-Status -Level $summaryLevel -Message "Deletion run completed."
+    Write-Output "Run ID        : $RunId"
+    Write-Output "Mode          : $executionMode"
     Write-Output "Source filter : $(if ($SourceFilter) { $SourceFilter -join ', ' } else { "(all sources)" })"
-    Write-Output "Total found   : $(if ($countIsExact) { "$totalFound" } else { ">=$totalFound (count incomplete)" })"
+    Write-Output "Found         : $(if ($countIsExact) { "$totalFound" } else { ">=$totalFound (count incomplete)" })"
     Write-Output "Deleted       : $deleted"
     Write-Output "Failed        : $failed"
-    Write-Output "Delete reqs   : $($sync.DeleteSubmitted)"
-    Write-Output "Query reqs    : $($sync.QuerySubmitted)"
-    Write-Output "Count reqs    : $($sync.CountSubmitted)"
-    Write-Output "429 retries   : $($sync.Retry429)"
-    Write-Output "Total reqs    : $($sync.DeleteSubmitted + $sync.QuerySubmitted + $sync.CountSubmitted)"
-    Write-Output "Elapsed time  : $elapsedStr"
+    Write-Output "API warnings  : 401=$($apiWarningStats.Http401), 429=$($apiWarningStats.Http429)"
+    Write-Output "Requests      : delete=$($sync.DeleteSubmitted), query=$($sync.QuerySubmitted), count=$($sync.CountSubmitted), total=$totalRequests"
+    Write-Output "429 retries   : $($sync.Retry429) (delete requests)"
+    Write-Output "Elapsed       : $elapsedStr"
 
     if (($apiWarningStats.Http401 -gt 0) -or ($apiWarningStats.Http429 -gt 0)) {
         Write-Log ([ordered]@{ level = 'warn'; event = 'api_warning_summary'; http_401 = $apiWarningStats.Http401; http_429 = $apiWarningStats.Http429 })
@@ -1586,7 +1330,7 @@ function Remove-SentinelThreatIndicators {
         $recountRetryCount   = 0
         $recountRetryDelays  = @(10, 20, 40)
         $recountMaxRetries   = $recountRetryDelays.Count
-        $recountPageSize     = $PageSize
+        $recountPageSize     = $BatchSize
         $recountState        = New-FetchState -InitialQueryUri $queryUri -Filter $SourceFilter
 
         while ($true) {
@@ -1599,9 +1343,6 @@ function Remove-SentinelThreatIndicators {
                     Start-Sleep -Seconds $retryDelay
                     $freshToken = Get-BearerToken
                     if ($freshToken) { $headers["Authorization"] = "Bearer $freshToken" }
-                    $script:QueryBodyMode   = $null
-                    $script:QueryApiVersion = $apiVersion
-                    $script:ListApiVersion  = $apiVersion
                     $recountState = New-FetchState -InitialQueryUri $queryUri -Filter $SourceFilter
                     continue
                 }
