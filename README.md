@@ -1,6 +1,6 @@
 # Microsoft Defender Threat Intelligence Toolkit
 
-A community PowerShell toolkit for managing **Microsoft Sentinel Threat Intelligence indicators** via the Azure REST API.
+A community PowerShell toolkit for managing **Microsoft Sentinel Threat Intelligence indicators**.
 
 ---
 
@@ -125,8 +125,6 @@ The screenshot below shows the indicator delete progress view used during bulk c
    ```powershell
     .\Scripts\Invoke-RemoveSentinelThreatIndicator.ps1
    ```
-
-```
 
 ---
 

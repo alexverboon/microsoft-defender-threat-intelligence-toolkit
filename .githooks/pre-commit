@@ -4,8 +4,29 @@
 # Regex for Azure subscription ID format (8-4-4-4-12 hex groups)
 PATTERN='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
 
-# Check staged files for subscription ID patterns
-MATCHES=$(git diff --cached --name-only | xargs grep -En "$PATTERN" 2>/dev/null)
+# Allowed placeholder GUID (safe non-production value)
+PLACEHOLDER_GUID='00000000-0000-0000-0000-000000000000'
+
+# Check staged text files for GUID patterns, but allow the all-zero placeholder.
+# Using git show :path ensures we scan staged content, not the working tree.
+MATCHES=""
+while IFS= read -r file; do
+    case "$file" in
+        *.ps1|*.psm1|*.psd1|*.md|*.txt|*.json|*.yml|*.yaml|*.xml|*.csv|*.ini|*.cfg|*.conf|*.sh)
+            fileMatches=$(git show ":$file" 2>/dev/null | grep -En "$PATTERN" | grep -Ev "$PLACEHOLDER_GUID" | sed "s|^|$file:|")
+            if [ -n "$fileMatches" ]; then
+                if [ -n "$MATCHES" ]; then
+                    MATCHES="$MATCHES
+$fileMatches"
+                else
+                    MATCHES="$fileMatches"
+                fi
+            fi
+            ;;
+    esac
+done <<EOF
+$(git diff --cached --name-only --diff-filter=ACMR)
+EOF
 
 if [ -n "$MATCHES" ]; then
     echo ""
@@ -13,6 +34,7 @@ if [ -n "$MATCHES" ]; then
     echo "$MATCHES"
     echo ""
     echo "Remove sensitive values before committing."
+    echo "Allowed placeholder: $PLACEHOLDER_GUID"
     echo ""
     exit 1
 fi
