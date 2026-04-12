@@ -4,7 +4,7 @@ $SubscriptionId    = ""  # Subscription ID of the Sentinel workspace
 $ResourceGroupName = "rg_sentinel01"  # Resource group containing the target workspace
 $WorkspaceName     = "AVSentinel01"   # Log Analytics workspace name linked to Microsoft Sentinel
 $BatchSize         = 100      # Number of indicators to delete in each batch (smaller = safer to avoid rate limits)
-$SourceFilter      = @("FEODOtrackerIPBlockList")  # one or more sources, e.g. @("ThreatViewIPBlockList","ThreatViewURLBlockList") - required for safety
+$SourceFilter      = @("DigitalSide")  # one or more sources, e.g. @("ThreatViewIPBlockList","ThreatViewURLBlockList") - required for safety
 $ConcurrentWorkers = 5        # Max concurrent DELETE workers on PowerShell 7+; sustained rate is controlled separately
 $TargetDeleteRatePerSecond = 10.0  # Sustained DELETE rate across all workers (~3600/hour)
 $ShowAPIWarnings = $false  # $true = print per-request API diagnostics
