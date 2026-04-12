@@ -110,13 +110,13 @@ The screenshot below shows the indicator delete progress view used during bulk c
     $SubscriptionId    = "<subscription-guid>"       # Required: Azure subscription GUID containing the Sentinel workspace
     $ResourceGroupName = "<resource-group-name>"     # Required: Azure resource group name containing the workspace
     $WorkspaceName     = "<workspace-name>"          # Required: Log Analytics workspace name linked to Sentinel
-    $BatchSize         = 100                          # Integer > 0; lower values reduce burst pressure
-    $SourceFilter      = @("<source-name>")          # One or more source names; use @() for ALL sources
-    $ConcurrentWorkers = 5                            # Integer >= 1; used on PowerShell 7+ for parallel delete workers
-    $TargetDeleteRatePerSecond = 10.0                # Decimal > 0; sustained delete rate across all workers
-    $ShowAPIWarnings = $false                        # $true = print per-request API diagnostics
-    $Confirm           = $true                        # $true = confirmation prompt; set $false for unattended runs
-    $WhatIf            = $false                       # $true = simulate without deleting indicators
+    $BatchSize         = 100                         # Number of indicators to delete in each batch 
+    $SourceFilter      = @("<source-name>")          # one or more sources, e.g. @("ThreatViewIPBlockList","ThreatViewURLBlockList")
+    $ConcurrentWorkers = 5                           # Max concurrent DELETE workers; sustained rate is controlled separately by TargetDeleteRatePerSecond
+    $TargetDeleteRatePerSecond = 10.0                # Sustained DELETE rate across all workers. Start with 1.0 req/s as a safe baseline (~3600/hour).         Higher values (for example 10.0 req/s) can speed up overall processing but increase the chance of throttling (HTTP 429), depending on tenant and subscription limits.
+    $ShowAPIWarnings = $false                        # When set, writes per-request 401/429 throttle diagnostics to the console. By default these messages are suppressed.
+    $Confirm           = $true                       # $true = confirmation prompt; set $false for unattended runs
+    $WhatIf            = $false                      # $true = simulate without deleting indicators
     $LogFile           = ""                          # Optional full file path; leave "" for default (script folder\Logs)
    ```
 
