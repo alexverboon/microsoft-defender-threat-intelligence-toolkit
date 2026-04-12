@@ -34,7 +34,7 @@ A new file is created per run. The `Logs` folder is auto-created if missing.
 
 ```log
 ts=2026-04-12T13:44:10Z level=info run_id=11571876 event=run_started subscription_id=00000000-0000-0000-0000-000000000000 resource_group=rg_sentinel01 workspace=AVSentinel01 source_filter=FEODOtrackerIPBlockList
-ts=2026-04-12T13:44:11Z level=info run_id=11571876 event=preflight_config run_id=11571876 log_file=/logs/Remove-SentinelThreatIndicators_20260412_154410.log
+ts=2026-04-12T13:44:11Z level=info run_id=11571876 event=preflight_config log_file=/logs/Remove-SentinelThreatIndicators_20260412_154410.log
 ts=2026-04-12T13:44:11Z level=info run_id=11571876 event=delete_started source_filter=FEODOtrackerIPBlockList found=9340
 ts=2026-04-12T13:47:23Z level=info run_id=11571876 event=delete_progress deleted=1172 failed=0 found=9340 remaining=8165 eta="22m 3s"
 ```
