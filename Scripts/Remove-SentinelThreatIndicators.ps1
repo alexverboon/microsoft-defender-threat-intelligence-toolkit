@@ -1,7 +1,8 @@
-function Remove-SentinelThreatIndicator {
+function Remove-SentinelThreatIndicators {
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
     <#
     .SYNOPSIS
-        Remove-SentinelThreatIndicator - Deletes threat intelligence indicators from a Microsoft Sentinel workspace, with optional list-only mode.
+        Remove-SentinelThreatIndicators - Deletes threat intelligence indicators from a Microsoft Sentinel workspace.
     .PARAMETER SubscriptionId
         Azure subscription ID containing the Sentinel workspace.
     .PARAMETER ResourceGroupName
@@ -12,16 +13,16 @@ function Remove-SentinelThreatIndicator {
         Filter indicators by one or more source names. Leave empty to target all sources.
     .PARAMETER PageSize
         Number of indicators to retrieve per API page. Defaults to 100.
-    .PARAMETER ListOnly
-        When set, lists indicators without deleting them.
-    .PARAMETER ThrottleLimit
-        Maximum concurrent DELETE requests. Requires PowerShell 7+; ignored on PS 5.
-    .PARAMETER Force
-        Skips the deletion confirmation prompt.
+    .PARAMETER ConcurrentWorkers
+        Maximum concurrent DELETE workers. Requires PowerShell 7+; ignored on PS 5.
+    .PARAMETER TargetDeleteRatePerSecond
+        Sustained DELETE request rate across the whole run. Use values like 0.25 to stay below ARM write limits.
     .PARAMETER LogFile
-        Path to the log file. Defaults to Remove-SentinelThreatIndicator.log in the script's folder.
-    .PARAMETER RecountAfterBatch
-        When set, recounts remaining indicators after each delete batch and updates progress totals.
+        Path to the log file. Defaults to Remove-SentinelThreatIndicators.log in the script's folder.
+    .PARAMETER ProgressRefreshIntervalSeconds
+        Interval in seconds for pausing deletes briefly, recounting remaining indicators, and refreshing the delete progress bar.
+    .PARAMETER ShowAPIWarnings
+        When set, writes per-request 401/429 throttle diagnostics to the console. By default these messages are suppressed.
     #>
     param (
         [string]$SubscriptionId,
@@ -29,11 +30,11 @@ function Remove-SentinelThreatIndicator {
         [string]$WorkspaceName,
         [string[]]$SourceFilter,
         [int]$PageSize,
-        [bool]$ListOnly,
-        [int]$ThrottleLimit,
-        [switch]$Force,
+        [int]$ConcurrentWorkers,
+        [double]$TargetDeleteRatePerSecond = 0.25,
         [string]$LogFile = "",
-        [bool]$RecountAfterBatch = $true
+        [int]$ProgressRefreshIntervalSeconds = 60,
+        [switch]$ShowAPIWarnings
     )
 
     # Validate required parameters
@@ -54,19 +55,41 @@ function Remove-SentinelThreatIndicator {
     }
 
     if (-not $LogFile) {
-        $logDir  = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+        $baseDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+        $logDir  = Join-Path $baseDir "Logs"
+        if (-not (Test-Path -Path $logDir -PathType Container)) {
+            New-Item -Path $logDir -ItemType Directory -Force -Confirm:$false | Out-Null
+        }
         $logDate = Get-Date -Format 'yyyyMMdd_HHmmss'
-        $LogFile = Join-Path $logDir "Remove-SentinelThreatIndicator_$logDate.log"
+        $LogFile = Join-Path $logDir "Remove-SentinelThreatIndicators_$logDate.log"
     }
 
+    $RunId = Get-Random -Minimum 10000000 -Maximum 99999999
+
     function Write-Log {
-        param([string]$Message)
-        $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-        "$timestamp  $Message" | Out-File -FilePath $LogFile -Append -Encoding utf8
+        param([System.Collections.Specialized.OrderedDictionary]$Fields)
+        $level = if ($Fields.Contains('level')) { $Fields['level'] } else { 'info' }
+        $ts    = [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+        $pairs = [System.Collections.Generic.List[string]]::new()
+        $pairs.Add("ts=$ts")
+        $pairs.Add("level=$level")
+        $pairs.Add("run_id=$RunId")
+        foreach ($key in $Fields.Keys) {
+            if ($key -eq 'level') { continue }
+            $val = $Fields[$key]
+            if ($null -eq $val) { $val = 'null' }
+            # Quote values that contain spaces, = or "
+            if ($val -match '[ =""]') { $val = '"' + ($val -replace '"', '\"') + '"' }
+            $pairs.Add("$key=$val")
+        }
+        ($pairs -join ' ') | Out-File -FilePath $LogFile -Append -Encoding utf8 -Confirm:$false
     }
 
     Write-Output "Log file: $LogFile"
-    Write-Log "Run initiated | SubscriptionId: $SubscriptionId | ResourceGroup: $ResourceGroupName | Workspace: $WorkspaceName | SourceFilter: $(if ($SourceFilter) { $SourceFilter -join ', ' } else { '(all sources)' })"
+    Write-Output "Run ID: $RunId"
+    Write-Log ([ordered]@{ event = 'run_started'; subscription_id = $SubscriptionId; resource_group = $ResourceGroupName; workspace = $WorkspaceName; source_filter = $(if ($SourceFilter) { $SourceFilter -join ', ' } else { '(all sources)' }) })
+
+    $toolkitVersion = '1.0.0'
 
     $requiredModules = @('Az.Accounts')
     foreach ($module in $requiredModules) {
@@ -80,8 +103,17 @@ function Remove-SentinelThreatIndicator {
         $PageSize = 100
     }
 
-    $ProgressIdListCollect   = 10
-    $ProgressIdDeleteCollect = 20
+    if (-not $ConcurrentWorkers -or $ConcurrentWorkers -lt 1) {
+        $ConcurrentWorkers = 1
+    }
+
+    if (-not $TargetDeleteRatePerSecond -or $TargetDeleteRatePerSecond -le 0) {
+        $TargetDeleteRatePerSecond = 0.25
+    }
+
+    if (-not $ProgressRefreshIntervalSeconds -or $ProgressRefreshIntervalSeconds -lt 5) {
+        $ProgressRefreshIntervalSeconds = 60
+    }
 
     function Write-Status {
         <#
@@ -97,31 +129,38 @@ function Remove-SentinelThreatIndicator {
         Write-Output "[$Level] $Message"
     }
 
-    function Confirm-Deletion {
-        <#
-        .SYNOPSIS
-            Prompts the user to confirm indicator deletion.
-        #>
+    $apiWarningStats = [hashtable]::Synchronized(@{
+        Http401 = 0
+        Http429 = 0
+    })
+
+    function Write-ApiWarningLog {
         param(
-            [int]$Count,
-            [string]$Scope,
-            [switch]$IsMinimumCount
+            [int]$StatusCode,
+            [string]$Operation,
+            [int]$Attempt = 0,
+            [int]$MaxAttempts = 0,
+            [string]$RawRetryAfter = $null,
+            [int]$WaitSeconds = 0,
+            [datetime]$ResumeAtUtc = [datetime]::MinValue,
+            [string]$Note = $null
         )
 
-        $title   = "Confirm Sentinel Indicator Deletion"
-        $countText = if ($IsMinimumCount) { "at least $Count" } else { "$Count" }
-        $scopeText = $Scope
-        if ($scopeText -and $scopeText -notmatch '[.!?]$') {
-            $scopeText += "."
+        $logData = [ordered]@{
+            level       = 'warn'
+            event       = 'api_warning'
+            status_code = $StatusCode
+            operation   = $Operation
         }
-        $message = "You are about to delete $countText indicator(s) $scopeText`n`nThis action cannot be undone."
-        $choices = [System.Management.Automation.Host.ChoiceDescription[]]@(
-            (New-Object System.Management.Automation.Host.ChoiceDescription "&Yes", "Proceed with deletion"),
-            (New-Object System.Management.Automation.Host.ChoiceDescription "&No", "Cancel and exit")
-        )
 
-        $selection = $Host.UI.PromptForChoice($title, $message, $choices, 1)
-        return ($selection -eq 0)
+        if ($Attempt -gt 0) { $logData.attempt = $Attempt }
+        if ($MaxAttempts -gt 0) { $logData.max_attempts = $MaxAttempts }
+        if ($RawRetryAfter) { $logData.retry_after_raw = $RawRetryAfter }
+        if ($WaitSeconds -gt 0) { $logData.wait_seconds = $WaitSeconds }
+        if ($ResumeAtUtc -gt [datetime]::MinValue) { $logData.resume_utc = $ResumeAtUtc.ToString("yyyy-MM-ddTHH:mm:ssZ") }
+        if ($Note) { $logData.note = $Note }
+
+        Write-Log $logData
     }
 
     function Get-BearerToken {
@@ -156,6 +195,210 @@ function Remove-SentinelThreatIndicator {
         return $t
     }
 
+    function Get-HttpStatusCode {
+        param($ErrorRecord)
+
+        $statusCode = 0
+        try {
+            if ($ErrorRecord.Exception.Response) {
+                if ($ErrorRecord.Exception.Response.StatusCode -is [int]) {
+                    $statusCode = [int]$ErrorRecord.Exception.Response.StatusCode
+                }
+                elseif ($ErrorRecord.Exception.Response.StatusCode.PSObject.Properties.Name -contains 'value__') {
+                    $statusCode = [int]$ErrorRecord.Exception.Response.StatusCode.value__
+                }
+                else {
+                    $statusCode = [int]$ErrorRecord.Exception.Response.StatusCode
+                }
+            }
+        }
+        catch {}
+
+        if (-not $statusCode) {
+            $errText = ""
+            try { $errText = ($ErrorRecord | Out-String) } catch {}
+            if (($ErrorRecord.Exception.Message -match '\b400\b') -or ($errText -match '\b400\b|Bad Request')) {
+                $statusCode = 400
+            }
+        }
+
+        return $statusCode
+    }
+
+    function Get-RetryAfterInfo {
+        param(
+            $ErrorRecord,
+            [int]$DefaultSeconds = 10
+        )
+
+        $raw = $null
+        $retryAfter = $DefaultSeconds
+        try {
+            $raw = $ErrorRecord.Exception.Response.Headers.GetValues("Retry-After") | Select-Object -First 1
+        }
+        catch {}
+
+        if ($raw) {
+            $parsedSeconds = 0
+            if ([int]::TryParse([string]$raw, [ref]$parsedSeconds)) {
+                $retryAfter = [math]::Max($parsedSeconds, 1)
+            }
+            else {
+                $retryAt = [datetimeoffset]::MinValue
+                if ([datetimeoffset]::TryParse([string]$raw, [ref]$retryAt)) {
+                    $delta = [math]::Ceiling(($retryAt - [datetimeoffset]::UtcNow).TotalSeconds)
+                    $retryAfter = [math]::Max($delta, 1)
+                }
+            }
+        }
+
+        [pscustomobject]@{
+            Raw         = $raw
+            Seconds     = $retryAfter
+            ResumeAtUtc = ([datetime]::UtcNow).AddSeconds($retryAfter)
+        }
+    }
+
+    function New-DeleteRateState {
+        param([double]$RatePerSecond)
+
+        $effectiveRate = if ($RatePerSecond -gt 0) { $RatePerSecond } else { 0.25 }
+
+        return [hashtable]::Synchronized(@{
+            Capacity         = 1.0
+            Tokens           = 1.0
+            RefillPerSecond  = $effectiveRate
+            LastRefillUtc    = [datetime]::UtcNow
+            CooldownUntilUtc = [datetime]::MinValue
+            Lock             = New-Object object
+        })
+    }
+
+    function Wait-DeleteRatePermit {
+        param([hashtable]$RateState)
+
+        while ($true) {
+            $waitMilliseconds = 0
+            [System.Threading.Monitor]::Enter($RateState.Lock)
+            try {
+                $now = [datetime]::UtcNow
+
+                if ($RateState.CooldownUntilUtc -gt $now) {
+                    $waitMilliseconds = [math]::Max([int][math]::Ceiling(($RateState.CooldownUntilUtc - $now).TotalMilliseconds), 100)
+                }
+                else {
+                    $elapsedSeconds = ($now - $RateState.LastRefillUtc).TotalSeconds
+                    if ($elapsedSeconds -gt 0) {
+                        $RateState.Tokens = [math]::Min([double]$RateState.Capacity, [double]$RateState.Tokens + ($elapsedSeconds * [double]$RateState.RefillPerSecond))
+                        $RateState.LastRefillUtc = $now
+                    }
+
+                    if ([double]$RateState.Tokens -ge 1.0) {
+                        $RateState.Tokens = [double]$RateState.Tokens - 1.0
+                        return
+                    }
+
+                    $missingTokens = 1.0 - [double]$RateState.Tokens
+                    $secondsToWait = if ([double]$RateState.RefillPerSecond -gt 0) {
+                        $missingTokens / [double]$RateState.RefillPerSecond
+                    }
+                    else {
+                        1
+                    }
+                    $waitMilliseconds = [math]::Max([int][math]::Ceiling($secondsToWait * 1000), 100)
+                }
+            }
+            finally {
+                [System.Threading.Monitor]::Exit($RateState.Lock)
+            }
+
+            Start-Sleep -Milliseconds $waitMilliseconds
+        }
+    }
+
+    function Set-DeleteRateCooldown {
+        param(
+            [hashtable]$RateState,
+            [datetime]$ResumeAtUtc
+        )
+
+        [System.Threading.Monitor]::Enter($RateState.Lock)
+        try {
+            if ($ResumeAtUtc -gt $RateState.CooldownUntilUtc) {
+                $RateState.CooldownUntilUtc = $ResumeAtUtc
+            }
+        }
+        finally {
+            [System.Threading.Monitor]::Exit($RateState.Lock)
+        }
+    }
+
+    function Invoke-SentinelRestMethod {
+        param(
+            [string]$Uri,
+            [hashtable]$Headers,
+            [ValidateSet('GET', 'POST', 'DELETE')]
+            [string]$Method,
+            [object]$Body = $null,
+            [string]$OperationName = 'Request',
+            [int]$MaxRetries = 5,
+            [int[]]$FallbackDelaysSec = @(5, 15, 30, 60, 120)
+        )
+
+        $attempt = 0
+        $did401Refresh = $false
+
+        do {
+            $attempt++
+            try {
+                $invokeParams = @{
+                    Uri         = $Uri
+                    Headers     = $Headers
+                    Method      = $Method
+                    ErrorAction = 'Stop'
+                }
+                if ($null -ne $Body) {
+                    $invokeParams.Body = ($Body | ConvertTo-Json -Depth 10)
+                }
+
+                return Invoke-RestMethod @invokeParams
+            }
+            catch {
+                $statusCode = Get-HttpStatusCode -ErrorRecord $_
+
+                if ($statusCode -eq 401 -and -not $did401Refresh) {
+                    $newToken = Get-BearerToken
+                    if ($newToken) {
+                        $Headers['Authorization'] = "Bearer $newToken"
+                        $did401Refresh = $true
+                        $apiWarningStats.Http401++
+                        Write-ApiWarningLog -StatusCode 401 -Operation $OperationName -Attempt $attempt -MaxAttempts $MaxRetries -Note 'token refreshed and retrying'
+                        $attempt--
+                        continue
+                    }
+                }
+
+                if ($statusCode -eq 429 -and $attempt -lt $MaxRetries) {
+                    $apiWarningStats.Http429++
+                    $fallbackIndex = [math]::Min(($attempt - 1), ($FallbackDelaysSec.Count - 1))
+                    $defaultDelay = $FallbackDelaysSec[$fallbackIndex]
+                    $retryInfo = Get-RetryAfterInfo -ErrorRecord $_ -DefaultSeconds $defaultDelay
+                    Write-ApiWarningLog -StatusCode 429 -Operation $OperationName -Attempt $attempt -MaxAttempts $MaxRetries -RawRetryAfter $retryInfo.Raw -WaitSeconds $retryInfo.Seconds -ResumeAtUtc $retryInfo.ResumeAtUtc
+                    if ($ShowAPIWarnings) {
+                        $ts = Get-Date -Format 'HH:mm:ss'
+                        $rawText = if ($retryInfo.Raw) { "'$($retryInfo.Raw)'" } else { '(missing)' }
+                        $resumeUtc = $retryInfo.ResumeAtUtc.ToString("yyyy-MM-dd HH:mm:ss 'UTC'")
+                        Write-Warning "[$ts] $OperationName throttled (429) - raw Retry-After=$rawText; interpreted wait=$($retryInfo.Seconds)s; resume ~$resumeUtc (attempt $attempt/$MaxRetries)..."
+                    }
+                    Start-Sleep -Seconds $retryInfo.Seconds
+                    continue
+                }
+
+                throw
+            }
+        } while ($attempt -lt $MaxRetries)
+    }
+
     $token = Get-BearerToken
     if (-not $token) {
         Write-Status -Level FAIL -Message "Failed to acquire access token. Run 'Connect-AzAccount' and try again."
@@ -174,6 +417,7 @@ function Remove-SentinelThreatIndicator {
                   "/resourceGroups/$ResourceGroupName" +
                   "/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName" +
                   "/providers/Microsoft.SecurityInsights"
+    $countUri   = "$baseUri/threatIntelligence/main/count?api-version=2025-07-01-preview"
     $queryUri   = "$baseUri/threatIntelligence/main/queryIndicators?api-version=$apiVersion"
     $deleteBase = "$baseUri/threatIntelligence/main/indicators"
     $script:QueryBodyMode = $null
@@ -281,37 +525,17 @@ function Remove-SentinelThreatIndicator {
                 $requestUri = Resolve-AbsoluteApiUri -CandidateUri $Uri
 
                 try {
-                    $response = Invoke-RestMethod -Uri $requestUri `
-                                                  -Headers $Headers `
-                                                  -Method POST `
-                                                  -Body ($body | ConvertTo-Json -Depth 10) `
-                                                  -ErrorAction Stop
+                    $response = Invoke-SentinelRestMethod -Uri $requestUri `
+                                                         -Headers $Headers `
+                                                         -Method POST `
+                                                         -Body $body `
+                                                         -OperationName "Query indicators"
                     $usedMode = $mode
                     break
                 }
                 catch {
                     $lastError = $_
-                    $statusCode = 0
-                    try {
-                        if ($_.Exception.Response) {
-                            if ($_.Exception.Response.StatusCode -is [int]) {
-                                $statusCode = [int]$_.Exception.Response.StatusCode
-                            }
-                            elseif ($_.Exception.Response.StatusCode.PSObject.Properties.Name -contains 'value__') {
-                                $statusCode = [int]$_.Exception.Response.StatusCode.value__
-                            }
-                            else {
-                                $statusCode = [int]$_.Exception.Response.StatusCode
-                            }
-                        }
-                    } catch {}
-                    if (-not $statusCode) {
-                        $errText = ""
-                        try { $errText = ($_ | Out-String) } catch {}
-                        if (($_.Exception.Message -match '\b400\b') -or ($errText -match '\b400\b|Bad Request')) {
-                            $statusCode = 400
-                        }
-                    }
+                    $statusCode = Get-HttpStatusCode -ErrorRecord $_
 
                     # On 400, try other payload schema variants before failing.
                     if ($statusCode -eq 400 -and $probeModes.Count -gt 1) {
@@ -325,27 +549,7 @@ function Remove-SentinelThreatIndicator {
             if (-not $response) {
                 $statusCode = 0
                 if ($lastError) {
-                    try {
-                        if ($lastError.Exception.Response) {
-                            if ($lastError.Exception.Response.StatusCode -is [int]) {
-                                $statusCode = [int]$lastError.Exception.Response.StatusCode
-                            }
-                            elseif ($lastError.Exception.Response.StatusCode.PSObject.Properties.Name -contains 'value__') {
-                                $statusCode = [int]$lastError.Exception.Response.StatusCode.value__
-                            }
-                            else {
-                                $statusCode = [int]$lastError.Exception.Response.StatusCode
-                            }
-                        }
-                    } catch {}
-
-                    if (-not $statusCode) {
-                        $errText = ""
-                        try { $errText = ($lastError | Out-String) } catch {}
-                        if (($lastError.Exception.Message -match '\b400\b') -or ($errText -match '\b400\b|Bad Request')) {
-                            $statusCode = 400
-                        }
-                    }
+                    $statusCode = Get-HttpStatusCode -ErrorRecord $lastError
 
                     if ($statusCode -eq 400 -and $effectiveSize -gt 100) {
                         $nextSize = [math]::Max([int][math]::Floor($effectiveSize / 2), 100)
@@ -372,11 +576,11 @@ function Remove-SentinelThreatIndicator {
 
                             try {
                                 $candidateBody = New-QueryBody -PageSize $effectiveSize -SourceNames $Source -Token $SkipToken -Mode "legacy-no-sort"
-                                $candidateResponse = Invoke-RestMethod -Uri $candidateUri `
-                                                                       -Headers $Headers `
-                                                                       -Method POST `
-                                                                       -Body ($candidateBody | ConvertTo-Json -Depth 10) `
-                                                                       -ErrorAction Stop
+                                $candidateResponse = Invoke-SentinelRestMethod -Uri $candidateUri `
+                                                                              -Headers $Headers `
+                                                                              -Method POST `
+                                                                              -Body $candidateBody `
+                                                                              -OperationName "Query indicators"
                                 $script:QueryApiVersion = $candidateVersion
                                 $response = $candidateResponse
                                 $usedMode = "legacy-no-sort"
@@ -445,42 +649,53 @@ function Remove-SentinelThreatIndicator {
             [string[]]$Source
         )
 
-        $countUri = "https://management.azure.com/subscriptions/$SubscriptionId" +
-                    "/resourceGroups/$ResourceGroupName" +
-                    "/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName" +
-                    "/providers/Microsoft.SecurityInsights/threatIntelligence/main/count?api-version=2025-07-01-preview"
-
         $body = $null
-        if ($Source -and $Source.Count -gt 0) {
-            $clauses = @()
-            foreach ($src in $Source) {
-                $clauses += @{
-                    field    = "source"
-                    operator = "Equals"
-                    values   = @("$src")
+        if ($null -ne $Source) {
+            if ($Source.Count -gt 0) {
+                $clauses = @()
+                foreach ($src in $Source) {
+                    $clauses += @{
+                        field    = "source"
+                        operator = "Equals"
+                        values   = @("$src")
+                    }
+                }
+                $body = @{
+                    condition = @{
+                        conditionConnective = "Or"
+                        clauses             = $clauses
+                    }
                 }
             }
-            $body = @{
-                condition = @{
-                    conditionConnective = "Or"
-                    clauses             = $clauses
+            else {
+                $body = @{
+                    condition = @{
+                        conditionConnective = "Or"
+                        clauses             = @(
+                            @{
+                                field    = "source"
+                                operator = "NotEquals"
+                                values   = @("")
+                            }
+                        )
+                    }
                 }
             }
         }
 
         try {
             if ($body) {
-                $resp = Invoke-RestMethod -Uri $countUri `
-                                          -Headers $Headers `
-                                          -Method POST `
-                                          -Body ($body | ConvertTo-Json -Depth 10) `
-                                          -ErrorAction Stop
+                $resp = Invoke-SentinelRestMethod -Uri $countUri `
+                                                 -Headers $Headers `
+                                                 -Method POST `
+                                                 -Body $body `
+                                                 -OperationName "Count indicators"
             }
             else {
-                $resp = Invoke-RestMethod -Uri $countUri `
-                                          -Headers $Headers `
-                                          -Method POST `
-                                          -ErrorAction Stop
+                $resp = Invoke-SentinelRestMethod -Uri $countUri `
+                                                 -Headers $Headers `
+                                                 -Method POST `
+                                                 -OperationName "Count indicators"
             }
 
             if ($null -ne $resp.count) {
@@ -514,31 +729,10 @@ function Remove-SentinelThreatIndicator {
 
         $response = $null
         try {
-            $response = Invoke-RestMethod -Uri $requestUri -Headers $Headers -Method GET -ErrorAction Stop
+            $response = Invoke-SentinelRestMethod -Uri $requestUri -Headers $Headers -Method GET -OperationName "List indicators"
         }
         catch {
-            $statusCode = 0
-            try {
-                if ($_.Exception.Response) {
-                    if ($_.Exception.Response.StatusCode -is [int]) {
-                        $statusCode = [int]$_.Exception.Response.StatusCode
-                    }
-                    elseif ($_.Exception.Response.StatusCode.PSObject.Properties.Name -contains 'value__') {
-                        $statusCode = [int]$_.Exception.Response.StatusCode.value__
-                    }
-                    else {
-                        $statusCode = [int]$_.Exception.Response.StatusCode
-                    }
-                }
-            } catch {}
-
-            if (-not $statusCode) {
-                $errText = ""
-                try { $errText = ($_ | Out-String) } catch {}
-                if (($_.Exception.Message -match '\b400\b') -or ($errText -match '\b400\b|Bad Request')) {
-                    $statusCode = 400
-                }
-            }
+            $statusCode = Get-HttpStatusCode -ErrorRecord $_
 
             if ($statusCode -eq 400) {
                 foreach ($candidateVersion in @("2025-09-01", "2025-07-01-preview", "2024-09-01-preview")) {
@@ -552,7 +746,7 @@ function Remove-SentinelThreatIndicator {
 
                     try {
                         $candidateUri = Resolve-AbsoluteApiUri -CandidateUri $candidateUri
-                        $response = Invoke-RestMethod -Uri $candidateUri -Headers $Headers -Method GET -ErrorAction Stop
+                        $response = Invoke-SentinelRestMethod -Uri $candidateUri -Headers $Headers -Method GET -OperationName "List indicators"
                         $script:ListApiVersion = $candidateVersion
                         Write-Output "INFO: Using list API version '$candidateVersion'."
                         break
@@ -691,28 +885,7 @@ function Remove-SentinelThreatIndicator {
                     $errorDetail = $reader.ReadToEnd()
                 } catch {}
 
-                $statusCode = 0
-                try {
-                    if ($_.Exception.Response) {
-                        if ($_.Exception.Response.StatusCode -is [int]) {
-                            $statusCode = [int]$_.Exception.Response.StatusCode
-                        }
-                        elseif ($_.Exception.Response.StatusCode.PSObject.Properties.Name -contains 'value__') {
-                            $statusCode = [int]$_.Exception.Response.StatusCode.value__
-                        }
-                        else {
-                            $statusCode = [int]$_.Exception.Response.StatusCode
-                        }
-                    }
-                } catch {}
-
-                if (-not $statusCode) {
-                    $errText = ""
-                    try { $errText = ($_ | Out-String) } catch {}
-                    if (($_.Exception.Message -match '\b400\b') -or ($errText -match '\b400\b|Bad Request')) {
-                        $statusCode = 400
-                    }
-                }
+                $statusCode = Get-HttpStatusCode -ErrorRecord $_
 
                 if (($statusCode -eq 400) -and (-not $State.UseClientSideSourceFilter) -and $State.SourceFilter -and $State.SourceFilter.Count -gt 0) {
                     Write-Warning "Source-filtered query rejected (400). Falling back to client-side source filtering with paged scan."
@@ -751,197 +924,95 @@ function Remove-SentinelThreatIndicator {
         }
     }
 
-    if ($ListOnly) {
-        Write-Output "Querying indicators$(if ($SourceFilter) { " for source(s): $($SourceFilter -join ', ')" } else { " (all sources)" })..."
-
-        $allIndicators = [System.Collections.Generic.List[object]]::new()
-        $page          = 1
-        $fetchState    = New-FetchState -InitialQueryUri $queryUri -Filter $SourceFilter
-        $hadPaginationToken = $false
-
-        while ($true) {
-            $fetchResult = Get-ResilientIndicatorBatch -Headers $headers -State $fetchState -Size $PageSize -Sync $null
-            if ($fetchResult.FetchFailed) {
-                Write-Output "ERROR querying page $page — $($fetchResult.ErrorMessage)"
-                if ($fetchResult.ErrorDetail) { Write-Output "API detail: $($fetchResult.ErrorDetail)" }
-                return
-            }
-            if ($fetchResult.EndOfStream) { break }
-
-            $batch = $fetchResult.Batch
-            $batchCount = $fetchResult.BatchCount
-            $PageSize = $fetchResult.EffectiveSize
-            $hadPaginationToken = $fetchState.HadContinuation
-
-            $allIndicators.AddRange([object[]]@($batch))
-            if ($page -eq 1) {
-                Write-Log "Page size probe | Requested: $PageSize | API returned: $batchCount per page"
-                if ($batchCount -lt $PageSize) {
-                    Write-Output "INFO: Requested page size $PageSize but API returned $batchCount — API may be capping the page size."
-                }
-            }
-            Write-Progress -Activity "Collecting Threat Intelligence Indicators" `
-                           -Id $ProgressIdListCollect `
-                           -Status "Page $page | Fetched: $batchCount | Total so far: $($allIndicators.Count)" `
-                           -PercentComplete 0
-            $page++
-        }
-
-        Write-Progress -Activity "Collecting Threat Intelligence Indicators" -Id $ProgressIdListCollect -Completed
-
-        if (-not $hadPaginationToken -and $allIndicators.Count -ge $PageSize) {
-            Write-Output "WARNING: API returned a full page ($PageSize) but no continuation token. Results may be capped to one page."
-        }
-
-        if ($allIndicators.Count -eq 0) {
-            Write-Output "No indicators found$(if ($SourceFilter) { " for source(s) '$($SourceFilter -join "', '")'" })."
-            Write-Log "Completed | Mode: ListOnly | SourceFilter: $logSourceFilter | Found: 0"
-            return
-        }
-
-        $uniqueSources = $allIndicators | Select-Object -ExpandProperty properties |
-                         Select-Object -ExpandProperty source -Unique | Sort-Object
-        Write-Output ""
-        Write-Output "Found $($allIndicators.Count) indicator(s) across $($uniqueSources.Count) source(s):"
-        foreach ($src in $uniqueSources) {
-            $count = ($allIndicators | Where-Object { $_.properties.source -eq $src }).Count
-            Write-Output "  - $src ($count indicators)"
-        }
-        Write-Output ""
-        Write-Output "===== Indicator Listing ====="
-        Write-Output ""
-
-        $allIndicators | ForEach-Object {
-            $p = $_.properties
-            [PSCustomObject]@{
-                Name        = $_.name
-                DisplayName = $p.displayName
-                Source      = $p.source
-                PatternType = $p.patternType
-                Pattern     = $p.pattern
-                ThreatTypes = ($p.threatTypes -join ", ")
-                Confidence  = $p.confidence
-                ValidFrom   = $p.validFrom
-                ValidUntil  = $p.validUntil
-                Revoked     = $p.revoked
-                LastUpdated = $p.lastUpdatedTimeUtc
-            }
-        } | Format-Table -AutoSize -Wrap
-
-        Write-Output "============================="
-        Write-Output "Total: $($allIndicators.Count) indicator(s)"
-        Write-Log "Started | Mode: ListOnly | SourceFilter: $logSourceFilter | Found: $($allIndicators.Count)"
-        Write-Log "Completed | Mode: ListOnly | SourceFilter: $logSourceFilter | Found: $($allIndicators.Count)"
-        return
+    try {
+        Clear-Host
+    }
+    catch {
     }
 
+    Write-Output "==============================================================="
+    Write-Output "Microsoft Sentinel - Threat Intelligence Toolkit"
+    Write-Output "Version : $toolkitVersion"
+    Write-Output "Project : https://github.com/alexverboon/microsoft-defender-threat-intelligence-toolkit"
+    Write-Output "Author  : Alex Verboon"
+    Write-Output "==============================================================="
     Write-Output ""
     Write-Output "===== Preflight ====="
+    Write-Log ([ordered]@{ event = 'preflight_token'; status = 'access_token_acquired' })
     Write-Status -Level PASS -Message "Access token acquired."
+    Write-Log ([ordered]@{ event = 'preflight_config'; subscription_id = $SubscriptionId })
+    Write-Status -Level INFO -Message "Subscription ID: $SubscriptionId"
+    Write-Log ([ordered]@{ event = 'preflight_config'; resource_group = $ResourceGroupName })
+    Write-Status -Level INFO -Message "Resource group: $ResourceGroupName"
+    Write-Log ([ordered]@{ event = 'preflight_config'; workspace = $WorkspaceName })
     Write-Status -Level INFO -Message "Target workspace: $WorkspaceName"
+    Write-Log ([ordered]@{ event = 'preflight_config'; source_filter = $(if ($SourceFilter) { $SourceFilter -join ', ' } else { '(all sources)' }) })
     Write-Status -Level INFO -Message "Source filter: $(if ($SourceFilter) { $SourceFilter -join ', ' } else { "(all sources)" })"
-    Write-Status -Level INFO -Message "Execution mode: $(if ($PSVersionTable.PSVersion.Major -ge 7 -and $ThrottleLimit -gt 1) { "Parallel (Throttle=$ThrottleLimit)" } else { "Sequential" })"
-    Write-Output "====================="
+    Write-Log ([ordered]@{ event = 'preflight_config'; execution_mode = $(if ($PSVersionTable.PSVersion.Major -ge 7 -and $ConcurrentWorkers -gt 1) { 'parallel' } else { 'sequential' }); concurrent_workers = $ConcurrentWorkers })
+    Write-Status -Level INFO -Message "Execution mode: $(if ($PSVersionTable.PSVersion.Major -ge 7 -and $ConcurrentWorkers -gt 1) { "Parallel (ConcurrentWorkers=$ConcurrentWorkers)" } else { "Sequential" })"
+    Write-Log ([ordered]@{ event = 'preflight_config'; delete_rate_per_hour = $([math]::Round($TargetDeleteRatePerSecond * 3600, 0)) })
+    Write-Status -Level INFO -Message "Target delete rate: $TargetDeleteRatePerSecond req/s (~$([math]::Round($TargetDeleteRatePerSecond * 3600, 0))/hour)"
 
-    # Pass 1: Count indicators using exact count API; fallback to pagination count when unavailable.
-    Write-Output "Counting indicators$(if ($SourceFilter) { " for source(s): $($SourceFilter -join ', ')" } else { " (all sources)" })..."
+    $countIsExact = $true
+    $allSourcesFilter = @()
+    $totalAllIndicators = Get-IndicatorTotalCount -Headers $headers `
+                                                   -SubscriptionId $SubscriptionId `
+                                                   -ResourceGroupName $ResourceGroupName `
+                                                   -WorkspaceName $WorkspaceName `
+                                                   -Source $allSourcesFilter
 
-    $countIsExact = $false
     $totalFound   = Get-IndicatorTotalCount -Headers $headers `
                                             -SubscriptionId $SubscriptionId `
                                             -ResourceGroupName $ResourceGroupName `
                                             -WorkspaceName $WorkspaceName `
                                             -Source $SourceFilter
 
-    if ($null -ne $totalFound) {
-        $countIsExact = $true
-        Write-Status -Level PASS -Message "Exact count retrieved via TI count API: $totalFound"
+    if ($null -eq $totalFound) {
+        Write-Error "Exact source count API unavailable. Stopping run because delete mode now requires exact counts."
+        Write-Log ([ordered]@{ level = 'error'; event = 'run_aborted'; source_filter = $logSourceFilter; reason = 'exact source count API unavailable' })
+        return
+    }
+
+    if ($null -ne $totalAllIndicators) {
+        $sourceSharePct = if ($totalAllIndicators -gt 0) {
+            [math]::Round((([double]$totalFound / [double]$totalAllIndicators) * 100), 2)
+        }
+        else {
+            0
+        }
+
+        Write-Status -Level PASS -Message "Total indicators (all sources): $totalAllIndicators"
+        Write-Status -Level PASS -Message "Indicators matching source filter: $totalFound"
+        Write-Status -Level INFO -Message "Source share of total indicators: $sourceSharePct%"
+        Write-Log ([ordered]@{ event = 'preflight_counts'; total_all_sources = $totalAllIndicators; matching_source_filter = $totalFound; source_share_pct = $sourceSharePct })
     }
     else {
-        Write-Output "WARNING: Exact count API unavailable. Falling back to pagination-based counting."
+        Write-Status -Level WARN -Message "Exact total indicator count unavailable. Continuing with exact source count only."
+        Write-Status -Level PASS -Message "Indicators matching source filter: $totalFound"
+        Write-Log ([ordered]@{ level = 'warn'; event = 'preflight_counts'; total_all_sources = $null; matching_source_filter = $totalFound; note = 'exact total count unavailable' })
     }
-
-    if (-not $countIsExact) {
-
-        $totalFound    = 0
-        $countPage     = 1
-        $nextPageUri   = $queryUri
-        $seenPageLink  = [System.Collections.Generic.HashSet[string]]::new()
-        $firstBatch    = $true
-
-        do {
-            try {
-                $pageResult = Get-IndicatorPage -Headers $headers -Uri $nextPageUri -Source $SourceFilter -Size $PageSize -SkipToken $null
-                $batchCount = if ($pageResult.Items) { @($pageResult.Items).Count } else { 0 }
-                $PageSize   = $pageResult.EffectiveSize
-                $nextPageUri = $pageResult.NextLink
-
-                if ($batchCount -gt 0) {
-                    if ($firstBatch) {
-                        $firstBatch = $false
-                        Write-Log "Page size probe | Requested: $PageSize | API returned: $batchCount per page"
-                        if ($batchCount -lt $PageSize) {
-                            Write-Output "INFO: Requested page size $PageSize but API returned $batchCount — API may be capping the page size."
-                        }
-                    }
-                    $totalFound += $batchCount
-                    Write-Progress -Activity "Counting Indicators" `
-                                   -Id $ProgressIdDeleteCollect `
-                                   -Status "Page $countPage | Counted so far: $totalFound" `
-                                   -PercentComplete 0
-                    $countPage++
-                }
-
-                if ($nextPageUri -and (-not $seenPageLink.Add($nextPageUri))) {
-                    Write-Output "WARNING: Duplicate pagination link received during count; stopping to prevent loop."
-                    break
-                }
-            }
-            catch {
-                $errorDetail = ""
-                try {
-                    $reader      = [System.IO.StreamReader]::new($_.Exception.Response.GetResponseStream())
-                    $errorDetail = $reader.ReadToEnd()
-                } catch {}
-                Write-Output "ERROR counting page $countPage — $($_.Exception.Message)"
-                if ($errorDetail) { Write-Output "API detail: $errorDetail" }
-                return
-            }
-        } while ($nextPageUri)
-
-        Write-Progress -Activity "Counting Indicators" -Id $ProgressIdDeleteCollect -Completed
-    }
+    Write-Output "====================="
 
     if ($totalFound -eq 0) {
         Write-Output "No indicators found$(if ($SourceFilter) { " for source(s) '$($SourceFilter -join "', '")'" }). Nothing to delete."
-        Write-Log "Completed | Mode: Delete | SourceFilter: $logSourceFilter | Deleted: 0 | Nothing to delete"
+        Write-Log ([ordered]@{ event = 'run_completed'; source_filter = $logSourceFilter; deleted = 0; failed = 0; reason = 'nothing to delete' })
         return
     }
 
     Write-Output ""
-    if ($countIsExact) {
-        Write-Output "Found $totalFound indicator(s)$(if ($SourceFilter) { " from source(s) '$($SourceFilter -join "', '")'" })."
-    } else {
-        Write-Warning "Initial count is incomplete due to pagination behavior. Continuing with a minimum count of $totalFound."
-        Write-Output "Found at least $totalFound indicator(s)$(if ($SourceFilter) { " from source(s) '$($SourceFilter -join "', '")'" })."
-    }
+    Write-Output "Found $totalFound indicator(s)$(if ($SourceFilter) { " from source(s) '$($SourceFilter -join "', '")'" })."
     Write-Output ""
-    Write-Log "Started | Mode: Delete | SourceFilter: $logSourceFilter | Found: $(if ($countIsExact) { $totalFound } else { ">=$totalFound (count incomplete)" })"
+    Write-Log ([ordered]@{ event = 'delete_started'; source_filter = $logSourceFilter; found = $totalFound })
 
-    # Confirm before deleting
-    $scopeMsg = if ($SourceFilter) { "from source(s) '$($SourceFilter -join "', '")'" } else { "from ALL sources" }
-    if (-not $countIsExact) {
-        $scopeMsg = "$scopeMsg`n`nNote: initial count is a minimum estimate due to pagination behavior."
+    $deleteScope = if ($SourceFilter -and $SourceFilter.Count -gt 0) {
+        "$totalFound indicator(s) in workspace '$WorkspaceName' for source(s) '$($SourceFilter -join ", ")'"
     }
-    if ($Force) {
-        $confirmed = $true
-    } else {
-        $confirmed = Confirm-Deletion -Count $totalFound -Scope $scopeMsg -IsMinimumCount:(-not $countIsExact)
+    else {
+        "$totalFound indicator(s) in workspace '$WorkspaceName' (all sources)"
     }
-
-    if (-not $confirmed) {
-        Write-Output "Aborted. No indicators were deleted."
-        Write-Log "Aborted | Mode: Delete | SourceFilter: $logSourceFilter | Deleted: 0"
+    if (-not $PSCmdlet.ShouldProcess($deleteScope, "Delete threat intelligence indicators")) {
+        Write-Output "WhatIf: no indicators were deleted."
+        Write-Log ([ordered]@{ event = 'run_completed'; source_filter = $logSourceFilter; whatif = $true; simulated = $totalFound; deleted = 0; failed = 0 })
         return
     }
 
@@ -950,22 +1021,22 @@ function Remove-SentinelThreatIndicator {
     $sync        = [hashtable]::Synchronized(@{ Deleted = 0; Failed = 0; Processed = 0; DeleteSubmitted = 0; QuerySubmitted = 0; CountSubmitted = 0; Retry429 = 0 })
     $failedBag   = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
     $startTime   = [datetime]::UtcNow
-    $useParallel = ($PSVersionTable.PSVersion.Major -ge 7) -and ($ThrottleLimit -gt 1)
+    $useParallel = ($PSVersionTable.PSVersion.Major -ge 7) -and ($ConcurrentWorkers -gt 1)
+    $deleteRateState = New-DeleteRateState -RatePerSecond $TargetDeleteRatePerSecond
 
     Write-Output ""
     if ($useParallel) {
-        Write-Output "Running parallel deletes (throttle: $ThrottleLimit concurrent requests)..."
+        Write-Output "Running parallel deletes (workers: $ConcurrentWorkers)..."
     } else {
         Write-Output "Running sequential deletes..."
     }
     Write-Output ""
     
     $globalStartTime      = [datetime]::UtcNow
-    $lastProgressTime     = [datetime]::UtcNow
-    $progressIntervalSec  = 30
+    $lastProgressTime     = [datetime]::MinValue
     $tokenAcquiredAt      = [datetime]::UtcNow   # token was just fetched above before confirmation
     $tokenRefreshMinutes  = 45                   # Az tokens last ~60 min; refresh at 45
-    $printedRateLimitHeaders = $false            # print detailed 429 headers once for diagnostics
+    $printedRateLimitHeaders = $false            # print detailed 429 headers once when diagnostics are enabled
     $fetchBatchFailed     = $false
     $fetchBatchErrorText  = $null
     $endedByRemainingProbe = $false
@@ -973,29 +1044,71 @@ function Remove-SentinelThreatIndicator {
     $fetchRetryCount      = 0
     $fetchRetryDelaysSec  = @(15, 30, 60, 120, 180) # progressive back-off delays between retries
     $fetchRetryMaxAttempts = $fetchRetryDelaysSec.Count
+    $ProgressIdDeleteRun  = 30
 
     function Write-DeleteProgress {
-        param([switch]$Force)
+        param(
+            [switch]$Force,
+            [switch]$SkipRecount
+        )
 
         $now = [datetime]::UtcNow
-        if (-not $Force -and (($now - $lastProgressTime).TotalSeconds -lt $progressIntervalSec)) {
+        if (-not $Force -and (($now - $lastProgressTime).TotalSeconds -lt $ProgressRefreshIntervalSeconds)) {
             return
+        }
+
+        $remaining = $null
+        if (-not $SkipRecount -and $countIsExact) {
+            $sync.CountSubmitted++
+            $remaining = Get-IndicatorTotalCount -Headers $headers `
+                                                -SubscriptionId $SubscriptionId `
+                                                -ResourceGroupName $ResourceGroupName `
+                                                -WorkspaceName $WorkspaceName `
+                                                -Source $SourceFilter
+        }
+
+        if ($null -ne $remaining -and $countIsExact) {
+            $completedCount = [math]::Max(([int64]$totalFound - [int64]$remaining), 0)
+            if ($completedCount -gt $sync.Processed) {
+                $sync.Processed = $completedCount
+            }
         }
 
         $elapsed = ($now - $globalStartTime).TotalSeconds
         $rate = if ($elapsed -gt 0 -and $sync.Processed -gt 0) { $sync.Processed / $elapsed } else { 0 }
-        $remaining = [math]::Max($totalFound - $sync.Processed, 0)
+        if ($null -eq $remaining) {
+            $remaining = [math]::Max($totalFound - $sync.Processed, 0)
+        }
         $etaSec = if ($rate -gt 0) { [math]::Round($remaining / $rate) } else { 0 }
         $etaStr = if ($remaining -gt 0) {
             if ($etaSec -ge 3600)  { "{0}h {1}m" -f [int]($etaSec/3600), [int](($etaSec%3600)/60) }
             elseif ($etaSec -ge 60) { "{0}m {1}s" -f [int]($etaSec/60), $etaSec%60 }
             else { "{0}s" -f $etaSec }
         } else { "Done" }
-        $ts = Get-Date -Format 'HH:mm:ss'
-        $rateStr = if ($rate -gt 0) { "{0:F1}/s" -f $rate } else { "--" }
-        Write-Output "[$ts] Progress: Deleted=$($sync.Deleted) | Failed=$($sync.Failed) | Processed=$($sync.Processed)/$totalFound | ReqSubmitted(D/Q)=$($sync.DeleteSubmitted)/$($sync.QuerySubmitted) | 429Retries=$($sync.Retry429) | Rate=$rateStr | ETA=$etaStr"
+        $percentComplete = if ($totalFound -gt 0) {
+            [math]::Min([int][math]::Floor(($sync.Processed / [double]$totalFound) * 100), 100)
+        }
+        else {
+            0
+        }
+        $statusLine = "Deleted $($sync.Deleted) of $totalFound | Failed $($sync.Failed) | Remaining $remaining | ETA $etaStr"
+        Write-Progress -Activity "Deleting Threat Intelligence Indicators" `
+                       -Id $ProgressIdDeleteRun `
+                       -Status $statusLine `
+                       -PercentComplete $percentComplete
         $lastProgressTime = $now
+
+        if (-not $Force) {
+            Write-Log ([ordered]@{ event = 'delete_progress'; deleted = $sync.Deleted; failed = $sync.Failed; found = $totalFound; remaining = $remaining; eta = $etaStr })
+        }
+
+        return [pscustomobject]@{
+            Remaining       = [int64]$remaining
+            PercentComplete = $percentComplete
+        }
     }
+
+    Write-DeleteProgress -Force -SkipRecount | Out-Null
 
     while ($true) {
         # Fetch only the first filtered page each iteration; after deletion, the next
@@ -1041,7 +1154,7 @@ function Remove-SentinelThreatIndicator {
             }
 
             if ($fetchRetryCount -lt $fetchRetryMaxAttempts) {
-                if ($PageSize -gt 10) {
+                if ($failureStatus -eq 400 -and $PageSize -gt 10) {
                     $newPageSize = if ($PageSize -gt 50) { 50 } elseif ($PageSize -gt 25) { 25 } else { 10 }
                     if ($newPageSize -lt $PageSize) {
                         Write-Warning "Reducing page size from $PageSize to $newPageSize after fetch failure to improve endpoint compatibility."
@@ -1051,7 +1164,7 @@ function Remove-SentinelThreatIndicator {
                 $delaySec = $fetchRetryDelaysSec[$fetchRetryCount]
                 $fetchRetryCount++
                 $ts = Get-Date -Format 'HH:mm:ss'
-                Write-Warning "[$ts] All fetch paths returned 400 (attempt $fetchRetryCount/$fetchRetryMaxAttempts). Waiting ${delaySec}s before retrying..."
+                Write-Warning "[$ts] Fetch paths failed with HTTP $failureStatus (attempt $fetchRetryCount/$fetchRetryMaxAttempts). Waiting ${delaySec}s before retrying..."
                 if ($fetchResult.ErrorDetail) { Write-Output "  API detail: $($fetchResult.ErrorDetail)" }
                 Start-Sleep -Seconds $delaySec
 
@@ -1090,10 +1203,10 @@ function Remove-SentinelThreatIndicator {
         if ($useParallel) {
             $batchArray = @($batch)
             # Start with modest chunks so progress stays visible and request bursts stay controlled.
-            $parallelChunkSize = [math]::Max(($ThrottleLimit * 4), 12)
+            $parallelChunkSize = [math]::Max(($ConcurrentWorkers * 4), 12)
             $parallelChunkSize = [math]::Min($parallelChunkSize, 40)
-            $parallelChunkMin  = [math]::Max(($ThrottleLimit * 2), 6)
-            $parallelChunkMax  = [math]::Max(($ThrottleLimit * 12), 40)
+            $parallelChunkMin  = [math]::Max(($ConcurrentWorkers * 2), 6)
+            $parallelChunkMax  = [math]::Max(($ConcurrentWorkers * 12), 40)
             $parallelInterChunkDelayMs = 150
 
             $offset = 0
@@ -1102,21 +1215,25 @@ function Remove-SentinelThreatIndicator {
                 $chunk = @($batchArray[$offset..$chunkEnd])
                 $chunkLen = $chunk.Count
                 $retry429BeforeChunk = $sync.Retry429
+                $warn401BeforeChunk = $apiWarningStats.Http401
+                $warn429BeforeChunk = $apiWarningStats.Http429
 
-                $chunk | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+                $chunk | ForEach-Object -ThrottleLimit $ConcurrentWorkers -Parallel {
                 $s          = $using:sync
                 $bag        = $using:failedBag
                 $hdrs       = $using:headers
                 $delBase    = $using:deleteBase
                 $apiVer     = $using:apiVersion
+                $rateState  = $using:deleteRateState
+                $warnStats  = $using:apiWarningStats
 
                 $name      = $_.name
                 $deleteUri = "$delBase/$name`?api-version=$apiVer"
 
                 $getRetryAfter = {
-                    param($ex)
+                    param($ex, [int]$defaultSeconds)
                     $raw = $null
-                    $ra = 10
+                    $ra = $defaultSeconds
                     try {
                         $raw = $ex.Exception.Response.Headers.GetValues("Retry-After") | Select-Object -First 1
                     } catch {}
@@ -1140,7 +1257,63 @@ function Remove-SentinelThreatIndicator {
                     }
                 }
 
-                $maxRetries    = 3
+                $waitForPermit = {
+                    param($state)
+
+                    while ($true) {
+                        $waitMilliseconds = 0
+                        [System.Threading.Monitor]::Enter($state.Lock)
+                        try {
+                            $now = [datetime]::UtcNow
+
+                            if ($state.CooldownUntilUtc -gt $now) {
+                                $waitMilliseconds = [math]::Max([int][math]::Ceiling(($state.CooldownUntilUtc - $now).TotalMilliseconds), 100)
+                            }
+                            else {
+                                $elapsedSeconds = ($now - $state.LastRefillUtc).TotalSeconds
+                                if ($elapsedSeconds -gt 0) {
+                                    $state.Tokens = [math]::Min([double]$state.Capacity, [double]$state.Tokens + ($elapsedSeconds * [double]$state.RefillPerSecond))
+                                    $state.LastRefillUtc = $now
+                                }
+
+                                if ([double]$state.Tokens -ge 1.0) {
+                                    $state.Tokens = [double]$state.Tokens - 1.0
+                                    return
+                                }
+
+                                $missingTokens = 1.0 - [double]$state.Tokens
+                                $secondsToWait = if ([double]$state.RefillPerSecond -gt 0) {
+                                    $missingTokens / [double]$state.RefillPerSecond
+                                }
+                                else {
+                                    1
+                                }
+                                $waitMilliseconds = [math]::Max([int][math]::Ceiling($secondsToWait * 1000), 100)
+                            }
+                        }
+                        finally {
+                            [System.Threading.Monitor]::Exit($state.Lock)
+                        }
+
+                        Start-Sleep -Milliseconds $waitMilliseconds
+                    }
+                }
+
+                $setCooldown = {
+                    param($state, [datetime]$resumeAt)
+
+                    [System.Threading.Monitor]::Enter($state.Lock)
+                    try {
+                        if ($resumeAt -gt $state.CooldownUntilUtc) {
+                            $state.CooldownUntilUtc = $resumeAt
+                        }
+                    }
+                    finally {
+                        [System.Threading.Monitor]::Exit($state.Lock)
+                    }
+                }
+
+                $maxRetries    = 5
                 $attempt       = 0
                 $deleteSuccess = $false
                 $did401Refresh = $false
@@ -1148,6 +1321,7 @@ function Remove-SentinelThreatIndicator {
                 do {
                     $attempt++
                     try {
+                        & $waitForPermit $rateState
                         $s.DeleteSubmitted++
                         Invoke-RestMethod -Uri $deleteUri -Headers $hdrs -Method DELETE -ErrorAction Stop | Out-Null
                         $s.Deleted++
@@ -1167,7 +1341,10 @@ function Remove-SentinelThreatIndicator {
                                 if ($newToken) {
                                     $hdrs["Authorization"] = "Bearer $newToken"
                                     $did401Refresh = $true
-                                    Write-Warning "  401 Unauthorized - token refreshed, retrying..."
+                                    $warnStats.Http401++
+                                    if ($ShowAPIWarnings) {
+                                        Write-Warning "  401 Unauthorized - token refreshed, retrying..."
+                                    }
                                     $attempt--
                                     continue
                                 }
@@ -1176,10 +1353,14 @@ function Remove-SentinelThreatIndicator {
 
                         if ($sc -eq 429 -and $attempt -lt $maxRetries) {
                             $s.Retry429++
-                            $retryInfo = & $getRetryAfter $_
-                            $rawText = if ($retryInfo.Raw) { "'$($retryInfo.Raw)'" } else { "(missing)" }
-                            $resumeUtc = $retryInfo.ResumeAtUtc.ToString("yyyy-MM-dd HH:mm:ss 'UTC'")
-                            Write-Warning "  429 Too Many Requests — raw Retry-After=$rawText; interpreted wait=$($retryInfo.Seconds)s; resume ~$resumeUtc (attempt $attempt/$maxRetries)..."
+                            $warnStats.Http429++
+                            $retryInfo = & $getRetryAfter $_ (5 * $attempt)
+                            & $setCooldown $rateState $retryInfo.ResumeAtUtc
+                            if ($ShowAPIWarnings) {
+                                $rawText = if ($retryInfo.Raw) { "'$($retryInfo.Raw)'" } else { "(missing)" }
+                                $resumeUtc = $retryInfo.ResumeAtUtc.ToString("yyyy-MM-dd HH:mm:ss 'UTC'")
+                                Write-Warning "  429 Too Many Requests — raw Retry-After=$rawText; interpreted wait=$($retryInfo.Seconds)s; resume ~$resumeUtc (attempt $attempt/$maxRetries)..."
+                            }
                             Start-Sleep -Seconds $retryInfo.Seconds
                         }
                         else {
@@ -1200,6 +1381,16 @@ function Remove-SentinelThreatIndicator {
 
                 $retry429AfterChunk = $sync.Retry429
                 $chunk429 = $retry429AfterChunk - $retry429BeforeChunk
+                $warn401AfterChunk = $apiWarningStats.Http401
+                $warn429AfterChunk = $apiWarningStats.Http429
+                $chunk401Warnings = $warn401AfterChunk - $warn401BeforeChunk
+                $chunk429Warnings = $warn429AfterChunk - $warn429BeforeChunk
+                if ($chunk401Warnings -gt 0) {
+                    Write-Log ([ordered]@{ level = 'warn'; event = 'api_warning'; status_code = 401; operation = 'Delete indicators (parallel chunk)'; occurrences = $chunk401Warnings })
+                }
+                if ($chunk429Warnings -gt 0) {
+                    Write-Log ([ordered]@{ level = 'warn'; event = 'api_warning'; status_code = 429; operation = 'Delete indicators (parallel chunk)'; occurrences = $chunk429Warnings })
+                }
                 if ($chunk429 -gt 0) {
                     # If the current burst produced 429s, reduce chunk size and add cooldown.
                     $parallelChunkSize = [math]::Max([int][math]::Floor($parallelChunkSize / 2), $parallelChunkMin)
@@ -1208,11 +1399,11 @@ function Remove-SentinelThreatIndicator {
                 }
                 elseif ($parallelChunkSize -lt $parallelChunkMax) {
                     # Slowly scale up when no rate limiting is observed.
-                    $parallelChunkSize = [math]::Min(($parallelChunkSize + $ThrottleLimit), $parallelChunkMax)
+                    $parallelChunkSize = [math]::Min(($parallelChunkSize + $ConcurrentWorkers), $parallelChunkMax)
                     Start-Sleep -Milliseconds $parallelInterChunkDelayMs
                 }
 
-                Write-DeleteProgress -Force
+                Write-DeleteProgress | Out-Null
                 $offset += $chunkLen
             }
         }
@@ -1221,7 +1412,7 @@ function Remove-SentinelThreatIndicator {
                 $name      = $indicator.name
                 $deleteUri = "$deleteBase/$name`?api-version=$apiVersion"
 
-                $maxRetries    = 3
+                $maxRetries    = 5
                 $attempt       = 0
                 $deleteSuccess = $false
                 $did401Refresh = $false
@@ -1229,6 +1420,7 @@ function Remove-SentinelThreatIndicator {
                 do {
                     $attempt++
                     try {
+                        Wait-DeleteRatePermit -RateState $deleteRateState
                         $sync.DeleteSubmitted++
                         Invoke-RestMethod -Uri $deleteUri -Headers $headers -Method DELETE -ErrorAction Stop | Out-Null
                         $sync.Deleted++
@@ -1244,11 +1436,15 @@ function Remove-SentinelThreatIndicator {
                         $statusCode = if ($_.Exception.Response) { $_.Exception.Response.StatusCode.value__ } else { 0 }
 
                         if ($statusCode -eq 401 -and -not $did401Refresh) {
-                            Write-Output "  INFO: Token expired, refreshing..."
+                            if ($ShowAPIWarnings) {
+                                Write-Output "  INFO: Token expired, refreshing..."
+                            }
                             $newToken = Get-BearerToken
                             if ($newToken) {
                                 $headers["Authorization"] = "Bearer $newToken"
                                 $did401Refresh = $true
+                                $apiWarningStats.Http401++
+                                Write-ApiWarningLog -StatusCode 401 -Operation 'Delete indicator' -Attempt $attempt -MaxAttempts $maxRetries -Note 'token refreshed and retrying'
                                 $attempt--
                                 continue
                             } else {
@@ -1258,27 +1454,13 @@ function Remove-SentinelThreatIndicator {
                         }
                         elseif ($statusCode -eq 429 -and $attempt -lt $maxRetries) {
                             $sync.Retry429++
-                            $retryAfter = 10
-                            $retryAfterRaw = $null
-                            try {
-                                $raHeader = $_.Exception.Response.Headers.GetValues("Retry-After") | Select-Object -First 1
-                                $retryAfterRaw = $raHeader
-                                if ($raHeader) {
-                                    $parsedSeconds = 0
-                                    if ([int]::TryParse([string]$raHeader, [ref]$parsedSeconds)) {
-                                        $retryAfter = [math]::Max($parsedSeconds, 1)
-                                    }
-                                    else {
-                                        $retryAt = [datetimeoffset]::MinValue
-                                        if ([datetimeoffset]::TryParse([string]$raHeader, [ref]$retryAt)) {
-                                            $delta = [math]::Ceiling(($retryAt - [datetimeoffset]::UtcNow).TotalSeconds)
-                                            $retryAfter = [math]::Max($delta, 1)
-                                        }
-                                    }
-                                }
-                            } catch {}
+                            $apiWarningStats.Http429++
+                            $retryInfo = Get-RetryAfterInfo -ErrorRecord $_ -DefaultSeconds (5 * $attempt)
+                            $retryAfter = $retryInfo.Seconds
+                            $retryAfterRaw = $retryInfo.Raw
                             $ts = Get-Date -Format 'HH:mm:ss'
-                            if (-not $printedRateLimitHeaders -and $_.Exception.Response) {
+                            Write-ApiWarningLog -StatusCode 429 -Operation 'Delete indicator' -Attempt $attempt -MaxAttempts $maxRetries -RawRetryAfter $retryAfterRaw -WaitSeconds $retryAfter -ResumeAtUtc $retryInfo.ResumeAtUtc
+                            if ($ShowAPIWarnings -and -not $printedRateLimitHeaders -and $_.Exception.Response) {
                                 try {
                                     $respHeaders = $_.Exception.Response.Headers
                                     $headerKeys = @(
@@ -1302,9 +1484,12 @@ function Remove-SentinelThreatIndicator {
                                     }
                                 } catch {}
                             }
-                            $resumeUtc = ([datetime]::UtcNow).AddSeconds($retryAfter).ToString("yyyy-MM-dd HH:mm:ss 'UTC'")
-                            $rawText = if ($retryAfterRaw) { "'$retryAfterRaw'" } else { "(missing)" }
-                            Write-Output "[$ts] Rate limited (429) — raw Retry-After=$rawText; interpreted wait=${retryAfter}s; resume ~$resumeUtc (attempt $attempt/$maxRetries)..."
+                            Set-DeleteRateCooldown -RateState $deleteRateState -ResumeAtUtc $retryInfo.ResumeAtUtc
+                            if ($ShowAPIWarnings) {
+                                $resumeUtc = $retryInfo.ResumeAtUtc.ToString("yyyy-MM-dd HH:mm:ss 'UTC'")
+                                $rawText = if ($retryAfterRaw) { "'$retryAfterRaw'" } else { "(missing)" }
+                                Write-Output "[$ts] Rate limited (429) — raw Retry-After=$rawText; interpreted wait=${retryAfter}s; resume ~$resumeUtc (attempt $attempt/$maxRetries)..."
+                            }
                             Start-Sleep -Seconds $retryAfter
                         }
                         else {
@@ -1319,8 +1504,6 @@ function Remove-SentinelThreatIndicator {
                 } while (-not $deleteSuccess)
 
                 $sync.Processed++
-                # Proactive per-request throttle — paces DELETE calls to avoid 429 bursts
-                Start-Sleep -Milliseconds 250
                 Write-DeleteProgress
                 }
         }
@@ -1347,24 +1530,6 @@ function Remove-SentinelThreatIndicator {
             $fetchState.HadContinuation = $false
         }
 
-        if ($RecountAfterBatch) {
-            $sync.CountSubmitted++
-            $remainingCount = Get-IndicatorTotalCount -Headers $headers `
-                                                    -SubscriptionId $SubscriptionId `
-                                                    -ResourceGroupName $ResourceGroupName `
-                                                    -WorkspaceName $WorkspaceName `
-                                                    -Source $SourceFilter
-            if ($null -ne $remainingCount) {
-                $totalFound = $sync.Processed + [int64]$remainingCount
-                $countIsExact = $true
-                $ts = Get-Date -Format 'HH:mm:ss'
-                Write-Output "[$ts] Recount: Remaining=$remainingCount | ReconciledTotal=$totalFound"
-                if ($remainingCount -eq 0) {
-                    break
-                }
-            }
-        }
-        
         # Delay between batches to avoid rate limiting
         Start-Sleep -Milliseconds 1000
     }
@@ -1372,6 +1537,8 @@ function Remove-SentinelThreatIndicator {
     $deleted   = $sync.Deleted
     $failed    = $sync.Failed
     $failedIds = [System.Collections.Generic.List[string]]$failedBag
+
+    Write-Progress -Activity "Deleting Threat Intelligence Indicators" -Id $ProgressIdDeleteRun -Completed
 
     $totalElapsed = [datetime]::UtcNow - $startTime
     $elapsedStr   = if     ($totalElapsed.TotalHours -ge 1)  { "{0}h {1}m {2}s" -f [int]$totalElapsed.TotalHours, $totalElapsed.Minutes, $totalElapsed.Seconds }
@@ -1390,6 +1557,10 @@ function Remove-SentinelThreatIndicator {
     Write-Output "Total reqs    : $($sync.DeleteSubmitted + $sync.QuerySubmitted + $sync.CountSubmitted)"
     Write-Output "Elapsed time  : $elapsedStr"
 
+    if (($apiWarningStats.Http401 -gt 0) -or ($apiWarningStats.Http429 -gt 0)) {
+        Write-Log ([ordered]@{ level = 'warn'; event = 'api_warning_summary'; http_401 = $apiWarningStats.Http401; http_429 = $apiWarningStats.Http429 })
+    }
+
     $processedTotal = $deleted + $failed
     $countDelta = $totalFound - $processedTotal
     if ($endedByRemainingProbe) {
@@ -1401,7 +1572,7 @@ function Remove-SentinelThreatIndicator {
             if ($fetchBatchErrorText) {
                 Write-Output "Last query error: $fetchBatchErrorText"
             }
-            Write-Log "Count reconciliation skipped | Found: $totalFound | Processed: 0 | Reason: initial query failed"
+            Write-Log ([ordered]@{ level = 'warn'; event = 'count_reconciliation_skipped'; found = $totalFound; processed = 0; reason = 'initial query failed' })
             $countDelta = 0
         }
     }
@@ -1464,12 +1635,12 @@ function Remove-SentinelThreatIndicator {
                 Write-Warning "Count reconciliation mismatch detected. Found=$totalFound, Processed=$processedTotal (Delta=$countDelta). This can happen when indicators change during the run."
             }
             Write-Output "Remaining now : $remainingNow"
-            Write-Log "Count reconciliation | Found: $totalFound | Processed: $processedTotal | Delta: $countDelta | RemainingNow: $remainingNow"
+            Write-Log ([ordered]@{ level = 'warn'; event = 'count_reconciliation'; found = $totalFound; processed = $processedTotal; delta = $countDelta; remaining_now = $remainingNow })
         }
         else {
             Write-Warning "Count reconciliation mismatch detected. Found=$totalFound, Processed=$processedTotal (Delta=$countDelta). Recount failed."
             if ($recountErrorText) { Write-Output "Recount last error: $recountErrorText" }
-            Write-Log "Count reconciliation | Found: $totalFound | Processed: $processedTotal | Delta: $countDelta | RemainingNow: (recount failed)"
+            Write-Log ([ordered]@{ level = 'warn'; event = 'count_reconciliation'; found = $totalFound; processed = $processedTotal; delta = $countDelta; remaining_now = $null; recount_failed = $true })
         }
     }
 
@@ -1479,5 +1650,5 @@ function Remove-SentinelThreatIndicator {
         $failedIds | ForEach-Object { Write-Output "  - $_" }
     }
     Write-Output "==================="
-    Write-Log "Completed | Mode: Delete | SourceFilter: $logSourceFilter | Deleted: $deleted | Failed: $failed | Elapsed: $elapsedStr"
+    Write-Log ([ordered]@{ event = 'run_completed'; source_filter = $logSourceFilter; deleted = $deleted; failed = $failed; elapsed = $elapsedStr })
 }

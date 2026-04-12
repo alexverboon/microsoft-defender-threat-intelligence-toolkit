@@ -1,4 +1,4 @@
-# Microsoft Sentinel - Threat Intelligence - Maintenance Scripts
+# Microsoft Defender Threat Intelligence Toolkit
 
 A community PowerShell toolkit for managing **Microsoft Sentinel Threat Intelligence indicators** via the Azure REST API.
 
@@ -6,7 +6,7 @@ A community PowerShell toolkit for managing **Microsoft Sentinel Threat Intellig
 
 ## Overview
 
-This repository provides scripts to list and bulk-delete threat intelligence (TI) indicators from a Microsoft Sentinel workspace. It is designed for security engineers and SOC teams who need to clean up stale or unwanted indicators at scale.
+This repository provides scripts to bulk-delete threat intelligence (TI) indicators from a Microsoft Sentinel workspace. It is designed for security engineers and SOC teams who need to clean up stale or unwanted indicators at scale.
 
 ### The problem: indicator bloat
 
@@ -51,7 +51,11 @@ This returns the billed volume in GB and indicator count broken down by source �
 
 ### Cleaning up with this script
 
-With the source name identified, set `$SourceFilter` in `Invoke-DeleteSentinelThreatIntelligence.ps1` to one or more source values and run the script. It will count all matching indicators, prompt for confirmation, then delete them in batches — handling pagination, token refresh, and rate limiting automatically.
+With the source name identified, set `$SourceFilter` in `Invoke-RemoveSentinelThreatIndicator.ps1` to one or more source values and run the script. It will count all matching indicators, prompt for confirmation, then delete them in batches — handling pagination, token refresh, and rate limiting automatically.
+
+The screenshot below shows the indicator delete progress view used during bulk cleanup runs:
+
+![Indicator delete progress](docs/images/indicator-delete-progress.png)
 
 ---
 
@@ -59,8 +63,8 @@ With the source name identified, set `$SourceFilter` in `Invoke-DeleteSentinelTh
 
 | Script | Description |
 |--------|-------------|
-| `Scripts\delete-SentinelThreatIntelligence.ps1` | Contains the `Remove-SentinelThreatIndicator` function. Dot-source this file to load the function. |
-| `Scripts\Invoke-DeleteSentinelThreatIntelligence.ps1` | Caller script. Edit the configuration block at the top and run this file. |
+| `Scripts\Remove-SentinelThreatIndicators.ps1` | Contains the `Remove-SentinelThreatIndicators` function. Dot-source this file to load the function. |
+| `Scripts\Invoke-RemoveSentinelThreatIndicator.ps1` | Caller script. Edit the configuration block at the top and run this file. |
 
 ---
 
@@ -88,91 +92,113 @@ With the source name identified, set `$SourceFilter` in `Invoke-DeleteSentinelTh
    Connect-AzAccount
    ```
 
-3. **Edit the configuration** in `Invoke-DeleteSentinelThreatIntelligence.ps1`:
+3. **Edit the configuration** in `Invoke-RemoveSentinelThreatIndicator.ps1`:
 
    ```powershell
-    $SubscriptionId    = ""                        # Subscription ID of the Sentinel workspace
-    $ResourceGroupName = "rg_sentinel01"
-    $WorkspaceName     = "AVSentinel01"
-    $BatchSize         = 100                       # Number of indicators to delete in each batch
-    $SourceFilter      = @("ThreatViewIPBlockList")  # use @() for ALL sources
-    $ListOnly          = $false                    # $true = list only, no deletion
-    $ThrottleLimit     = 3                         # parallel threads (PS 7+ only)
-    $Force             = $false                    # $true = skip confirmation prompt
-    $LogFile           = ""                       # leave "" to use default log location
+    $SubscriptionId    = "<subscription-guid>"       # Required: Azure subscription GUID containing the Sentinel workspace
+    $ResourceGroupName = "<resource-group-name>"     # Required: Azure resource group name containing the workspace
+    $WorkspaceName     = "<workspace-name>"          # Required: Log Analytics workspace name linked to Sentinel
+    $BatchSize         = 100                          # Integer > 0; lower values reduce burst pressure
+    $SourceFilter      = @("<source-name>")          # One or more source names; use @() for ALL sources
+    $ConcurrentWorkers = 5                            # Integer >= 1; used on PowerShell 7+ for parallel delete workers
+    $TargetDeleteRatePerSecond = 10.0                # Decimal > 0; sustained delete rate across all workers
+    $ShowAPIWarnings = $false                        # $true = print per-request API diagnostics
+    $Confirm           = $true                        # $true = confirmation prompt; set $false for unattended runs
+    $LogFile           = ""                          # Optional full file path; leave "" for default (script folder\Logs)
    ```
 
 4. **Run the caller script:**
 
    ```powershell
-   .\Scripts\Invoke-DeleteSentinelThreatIntelligence.ps1
+    .\Scripts\Invoke-RemoveSentinelThreatIndicator.ps1
    ```
 
 ## Usage Examples
 
-**List all indicators for specific sources (no deletion):**
+**Simulate delete run without changes (`-WhatIf`):**
 
 ```powershell
-Remove-SentinelThreatIndicator `
+Remove-SentinelThreatIndicators `
     -SubscriptionId    "<sub-id>" `
     -ResourceGroupName "<rg>" `
     -WorkspaceName     "<workspace>" `
     -SourceFilter      @("ThreatViewIPBlockList", "ThreatViewURLBlockList") `
-    -ListOnly          $true
+    -WhatIf
 ```
 
 **Delete indicators from specific sources with confirmation prompt:**
 
 ```powershell
-Remove-SentinelThreatIndicator `
+Remove-SentinelThreatIndicators `
     -SubscriptionId    "<sub-id>" `
     -ResourceGroupName "<rg>" `
     -WorkspaceName     "<workspace>" `
-    -SourceFilter      @("ThreatViewIPBlockList", "ThreatViewURLBlockList")
+    -SourceFilter      @("ThreatViewIPBlockList", "ThreatViewURLBlockList") `
+    -Confirm
 ```
 
 **Delete all indicators from all sources, skip confirmation (unattended/automation):**
 
 ```powershell
-Remove-SentinelThreatIndicator `
+Remove-SentinelThreatIndicators `
     -SubscriptionId    "<sub-id>" `
     -ResourceGroupName "<rg>" `
     -WorkspaceName     "<workspace>" `
-    -Force
+    -Confirm:$false
 ```
 
 ---
 
 ## Logging
 
-The script writes log entries during key execution phases (run initialization, page-size probe, start, completion/abort). Each entry includes:
+The script writes one logfmt line per event to the log file. Every line contains fixed leading keys followed by event-specific key=value pairs:
 
-- Timestamp (`yyyy-MM-dd HH:mm:ss`)
-- Mode (`Delete` or `ListOnly`)
-- Source filter applied
-- Indicators found
-- Indicators deleted / failed (Delete mode)
-- Elapsed time (Delete mode)
+- `ts` — ISO 8601 UTC timestamp
+- `level` — severity (`info`, `warn`, `error`)
+- `run_id` — unique random integer generated once per run
+- `event` — what happened (e.g. `run_started`, `preflight_config`, `delete_started`, `run_completed`)
 
-**Default log location:** `<script folder>\Remove-SentinelThreatIndicator_<yyyyMMdd_HHmmss>.log`
+Additional fields are included depending on the event, such as `subscription_id`, `workspace`, `source_filter`, `found`, `deleted`, `failed`, `elapsed`, `delta`, and `remaining_now`. Values containing spaces are quoted.
 
-A new log file is created for each run. If `$PSScriptRoot` is unavailable (e.g. interactive session), the current working directory is used.
+When API warning conditions occur, the log includes `api_warning` entries (for HTTP `401` token refresh and HTTP `429` throttling) plus an `api_warning_summary` line at the end of the run.
+
+The log also captures the full preflight information for each run, including workspace targeting details, execution mode, target delete rate, and the exact counts calculated before deletion starts.
+
+**Default log location:** `<script folder>\Logs\Remove-SentinelThreatIndicators_<yyyyMMdd_HHmmss>.log`
+
+A new log file is created for each run. The `Logs` folder is created automatically if it does not exist. If `$PSScriptRoot` is unavailable (e.g. interactive session), the current working directory is used.
 
 **Example log entries:**
 
 ```
-2026-04-11 15:11:57  Run initiated | SubscriptionId: 00000000-0000-0000-0000-00000000000X | ResourceGroup: rg_sentinel01 | Workspace: AVSentinel01 | SourceFilter: ThreatViewIPBlock, TORExitNodes
-2026-04-11 15:11:59  Started | Mode: Delete | SourceFilter: baseVISION-SOC-TI-Feed | Found: 1947621
+ts=2026-04-11T15:11:57Z level=info run_id=48273194 event=run_started subscription_id=00000000-0000-0000-0000-00000000000X resource_group=rg_sentinel01 workspace=AVSentinel01 source_filter="ThreatViewIPBlock, TORExitNodes"
+ts=2026-04-11T15:11:58Z level=info run_id=48273194 event=preflight_counts total_all_sources=2100000 matching_source_filter=1947621 source_share_pct=92.74
+ts=2026-04-11T15:12:00Z level=info run_id=48273194 event=delete_started source_filter=CoinBlocker found=1947621
+ts=2026-04-12T09:44:51Z level=info run_id=48273194 event=run_completed source_filter=CoinBlocker deleted=1947600 failed=21 elapsed="20h 22m 51s"
 ```
 
 ---
 
 ## Notes
 
-- The script uses the **Microsoft Sentinel REST API** (`2025-09-01`) directly, via `Invoke-RestMethod`.
+- The script uses the **Microsoft Sentinel / SecurityInsights REST API** directly, via `Invoke-RestMethod`.
 - Token refresh is handled automatically on `401 Unauthorized` responses.
-- Rate limiting (`429 Too Many Requests`) is handled with automatic backoff and retry (up to 3 attempts).
+- Rate limiting (`429 Too Many Requests`) is handled with automatic backoff and retry on delete, query, count, and internal fallback list requests.
 - Parallel deletion requires **PowerShell 7+**. On PowerShell 5.1 the script falls back to sequential deletion automatically.
+
+---
+
+## Used APIs
+
+The toolkit currently uses the following Microsoft Sentinel / SecurityInsights REST APIs:
+
+| Operation | Purpose | API version used | Microsoft Learn reference |
+|---------|---------|------------------|---------------------------|
+| Count | Exact pre-delete count and periodic remaining-count refresh | `2025-07-01-preview` | `Threat Intelligence API` - https://learn.microsoft.com/en-us/rest/api/securityinsights/threat-intelligence?view=rest-securityinsights-2025-07-01-preview |
+| Query | Fetch matching indicators in pages before deletion | `2025-09-01` by default, with compatibility fallback probing when required by the tenant | `Threat Intelligence API` - https://learn.microsoft.com/en-us/rest/api/securityinsights/threat-intelligence?view=rest-securityinsights-2025-07-01-preview |
+| Delete | Delete individual indicators | `2025-09-01` | `Threat Intelligence Indicator Delete API` - https://learn.microsoft.com/en-us/rest/api/securityinsights/threat-intelligence-indicator/delete?view=rest-securityinsights-2025-09-01&tabs=HTTP |
+
+**Not currently used:** The [Microsoft Graph Security Threat Intelligence API](https://learn.microsoft.com/en-us/graph/api/resources/security-threatintelligence-overview?view=graph-rest-1.0) is not used by this toolkit at this time, but will be considered for future updates.
 
 ---
 
@@ -182,13 +208,13 @@ The script is designed to handle workspaces with large numbers of indicators (te
 
 ### Phase 1 - Count before delete
 
-Before deleting anything, the script first calls the threat intelligence count endpoint to get an exact count. If that endpoint is unavailable, it falls back to pagination-based counting. During fallback counting, only a running total is maintained; indicator objects are not retained in memory.
+Before deleting anything, the script first calls the threat intelligence count endpoint (`2025-07-01-preview`) to get an exact count. If that endpoint is unavailable, delete mode stops immediately so the run never proceeds with an inexact pre-count.
 
 ### Phase 2 - Fetch, delete, repeat
 
-Rather than loading all indicators into memory, the script processes one page at a time and deletes that batch before moving on. Batch fetch uses a resilient shared fetch path (used by both delete mode and list-only mode):
+Rather than loading all indicators into memory, the script processes one page at a time and deletes that batch before moving on. Batch fetch uses a resilient shared fetch path:
 
-- Primary: filtered query endpoint.
+- Primary: filtered query endpoint (`2025-09-01`, with compatibility fallbacks when required by the tenant).
 - Fallback 1: client-side source filtering when filtered query returns 400.
 - Fallback 2: indicator list GET scan when query scan also returns 400.
 
@@ -210,11 +236,25 @@ This design has several benefits:
 
 ### Parallel vs. sequential deletion
 
-Within each batch, individual DELETE requests are issued either in parallel (PowerShell 7+ with `ForEach-Object -Parallel`) or sequentially (PowerShell 5.1). The `$ThrottleLimit` setting controls how many concurrent DELETE requests are in flight at once in parallel mode. Setting it too high may trigger `429 Too Many Requests` responses from the API; the default of `3` is a conservative starting point.
+Within each batch, individual DELETE requests are issued either in parallel (PowerShell 7+ with `ForEach-Object -Parallel`) or sequentially (PowerShell 5.1). The `$ConcurrentWorkers` setting controls how many workers can prepare delete calls, while `$TargetDeleteRatePerSecond` controls the sustained delete rate across the whole run with token-bucket pacing. For ARM-backed Sentinel cleanup jobs, a conservative starting point is `0.25` requests per second, which is about `900` deletes per hour and leaves headroom for query and count calls.
+
+### Tuning for throttling
+
+If you are seeing `429 Too Many Requests`, tune in this order:
+
+1. Lower `$TargetDeleteRatePerSecond` first.
+2. Increase `$ProgressRefreshIntervalSeconds` to reduce count calls.
+3. Lower `$ConcurrentWorkers` if you still see burst-related throttling on PowerShell 7+.
+
+For most production cleanup runs, `ConcurrentWorkers=1..2`, `TargetDeleteRatePerSecond=0.20..0.25`, and `ProgressRefreshIntervalSeconds=60..180` are safer defaults than increasing parallelism.
+
+### Progress updates
+
+During deletion the script maintains a single `0-100%` progress bar. Every `ProgressRefreshIntervalSeconds`, the script pauses briefly, recounts the remaining indicators for the active source filter, updates the progress bar, and then resumes deleting.
 
 ### Indicator removal process status
 
-![Cleanup process](docs/images/cleanup-process.png)
+![Indicator delete progress](docs/images/indicator-delete-progress.png)
 
 > **Note:** Depending on the total number of indicators to delete, the job can take **several hours** to complete. For workspaces with millions of indicators, plan accordingly and ensure the host running the script remains active for the duration.
 
