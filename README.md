@@ -6,7 +6,7 @@ A community PowerShell toolkit for managing **Microsoft Sentinel Threat Intellig
 
 ## Overview
 
-This repository provides scripts to bulk-delete threat intelligence (TI) indicators from a Microsoft Sentinel workspace. It is designed for security engineers and SOC teams who need to clean up stale or unwanted indicators at scale.
+The toolkit was developed to support Security Operations Teams and security engineers in managing threat intelligence (TI) indicators, including bulk deletion from a Microsoft Sentinel workspace.
 
 ### The problem: indicator bloat
 
@@ -64,7 +64,7 @@ The screenshot below shows the indicator delete progress view used during bulk c
 | Script | Description |
 |--------|-------------|
 | `Scripts\Common\Toolkit.Logging.ps1` | Shared logging helpers (`Initialize-ToolkitLogger`, `Write-Log`) for reuse across scripts. |
-| `Scripts\Remove-SentinelThreatIndicators.ps1` | Contains the `Remove-SentinelThreatIndicators` function. Dot-source this file to load the function. |
+| `Scripts\Remove-SentinelThreatIndicators.ps1` | Contains the `Remove-SentinelThreatIndicators` function. Dot-source this file to load the function. Uses a count-and-drain workflow designed for large datasets, with strict preflight count checks, rate/backoff controls, and end-of-run reconciliation. Full workflow and operational details: [docs/remove-sentinel-threat-indicators.md](docs/remove-sentinel-threat-indicators.md). |
 | `Scripts\Invoke-RemoveSentinelThreatIndicator.ps1` | Caller script. Edit the configuration block at the top and run this file. |
 
 ---
@@ -136,17 +136,6 @@ The toolkit writes structured logfmt output for each run. Logs include run-level
 - Default location for the current cleanup script: `<script folder>\Logs\Remove-SentinelThreatIndicators_<yyyyMMdd_HHmmss>.log`
 - Full logging reference: [docs/logging.md](docs/logging.md)
 
----
-
-## Notes
-
-- The script uses the **Microsoft Sentinel / SecurityInsights REST API** directly, via `Invoke-RestMethod`.
-- Token refresh is handled automatically on `401 Unauthorized` responses.
-- Rate limiting (`429 Too Many Requests`) is handled with automatic backoff and retry on delete, query, and count requests.
-- The script requires **PowerShell 7+**.
-
----
-
 ## Used APIs
 
 The toolkit currently uses the following Microsoft Sentinel / SecurityInsights REST APIs:
@@ -158,25 +147,6 @@ The toolkit currently uses the following Microsoft Sentinel / SecurityInsights R
 | Delete | Delete individual indicators | `2025-09-01` | `Threat Intelligence Indicator Delete API` - https://learn.microsoft.com/en-us/rest/api/securityinsights/threat-intelligence-indicator/delete?view=rest-securityinsights-2025-09-01&tabs=HTTP |
 
 **Not currently used:** The [Microsoft Graph Security Threat Intelligence API](https://learn.microsoft.com/en-us/graph/api/resources/security-threatintelligence-overview?view=graph-rest-1.0) is not used by this toolkit at this time, but will be considered for future updates.
-
----
-
-## How It Works at Scale
-
-The script uses a count-and-drain workflow designed for large datasets.
-
-1. **Strict preflight count:** It gets an exact source-filter count first. If exact source count is unavailable, delete mode stops.
-2. **Fetch path:** It uses the filtered query endpoint (`2025-09-01`) to fetch one page at a time.
-3. **Delete in small working sets:** It processes one fetched page at a time, deletes that page, then fetches again. This keeps memory bounded to roughly one page.
-4. **Rate and retry controls:** Delete throughput is paced by `$TargetDeleteRatePerSecond` and worker count (`$ConcurrentWorkers`). `401` triggers token refresh/retry, and `429` uses Retry-After backoff.
-5. **Progress and recount:** During the run, it periodically refreshes remaining count (default 60s) for reconciled progress and ETA.
-6. **End-of-run reconciliation:** If processed totals do not match initial count, it performs a reconciliation pass and logs mismatch details.
-
-For most production cleanup runs, start conservatively with `ConcurrentWorkers=1..2` and `TargetDeleteRatePerSecond=0.20..0.25`, then increase only if throttling remains low.
-
-> **Note:** Depending on the total number of indicators to delete, the job can take **several hours** to complete. For workspaces with millions of indicators, plan accordingly and ensure the host running the script remains active for the duration.
-
----
 
 ## License
 
