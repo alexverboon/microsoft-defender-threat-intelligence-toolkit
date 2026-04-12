@@ -64,8 +64,8 @@ The screenshot below shows the indicator delete progress view used during bulk c
 | Script | Description |
 |--------|-------------|
 | `Scripts\Common\Toolkit.Logging.ps1` | Shared logging helpers (`Initialize-ToolkitLogger`, `Write-Log`) for reuse across scripts. |
-| `Scripts\Remove-SentinelThreatIndicators.ps1` | Contains the `Remove-SentinelThreatIndicators` function. Dot-source this file to load the function. Uses a count-and-drain workflow designed for large datasets, with strict preflight count checks, rate/backoff controls, and end-of-run reconciliation. Full workflow and operational details: [docs/remove-sentinel-threat-indicators.md](docs/remove-sentinel-threat-indicators.md). |
-| `Scripts\Invoke-RemoveSentinelThreatIndicator.ps1` | Caller script. Edit the configuration block at the top and run this file. |
+| `Scripts\Remove-SentinelThreatIndicators.ps1` | Contains the `Remove-SentinelThreatIndicators` function. Uses a count-and-drain workflow designed for large datasets, with strict preflight count checks, rate/backoff controls, and end-of-run reconciliation. Full workflow and operational details: [docs/remove-sentinel-threat-indicators.md](docs/remove-sentinel-threat-indicators.md). |
+| `Scripts\Invoke-RemoveSentinelThreatIndicator.ps1` | Execution script used to run indicator deletion. Edit the configuration parameters at the top first, then run this file. |
 
 ---
 
