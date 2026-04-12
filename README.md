@@ -59,7 +59,7 @@ With the source name identified, set `$SourceFilter` in `Invoke-RemoveSentinelTh
 
 The screenshot below shows the indicator delete progress view used during bulk cleanup runs:
 
-![Indicator delete progress](docs/images/indicator-delete-progress.png)
+![Indicator delete progress](docs/images/indicator-delete-progress1.png)
 
 ---
 
