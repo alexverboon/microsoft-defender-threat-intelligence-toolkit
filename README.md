@@ -1,5 +1,9 @@
 # Microsoft Defender Threat Intelligence Toolkit
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+![PowerShell 7+](https://img.shields.io/badge/PowerShell-7%2B-5391FE?logo=powershell&logoColor=white)
+![Az.Accounts required](https://img.shields.io/badge/Az.Accounts-required-0078D4)
+
 A community PowerShell toolkit for managing **Microsoft Sentinel Threat Intelligence indicators**.
 
 ---
