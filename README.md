@@ -194,8 +194,8 @@ The toolkit currently uses the following Microsoft Sentinel / SecurityInsights R
 
 | Operation | Purpose | API version used | Microsoft Learn reference |
 |---------|---------|------------------|---------------------------|
-| Count | Exact pre-delete count and periodic remaining-count refresh | `2025-07-01-preview` | `Threat Intelligence API` - https://learn.microsoft.com/en-us/rest/api/securityinsights/threat-intelligence?view=rest-securityinsights-2025-07-01-preview |
-| Query | Fetch matching indicators in pages before deletion | `2025-09-01` by default, with compatibility fallback probing when required by the tenant | `Threat Intelligence API` - https://learn.microsoft.com/en-us/rest/api/securityinsights/threat-intelligence?view=rest-securityinsights-2025-07-01-preview |
+| Count | Exact pre-delete count and periodic remaining-count refresh | `2025-07-01-preview` | `Threat Intelligence Indicator Count API` - https://learn.microsoft.com/en-us/rest/api/securityinsights/threat-intelligence-indicator/count?view=rest-securityinsights-2025-07-01-preview&tabs=HTTP |
+| Query | Fetch matching indicators in pages before deletion | `2025-09-01` by default, with compatibility fallback probing when required by the tenant | `Threat Intelligence Indicator Query API` - https://learn.microsoft.com/en-us/rest/api/securityinsights/threat-intelligence-indicator/query-indicators?view=rest-securityinsights-2025-09-01&tabs=HTTP |
 | Delete | Delete individual indicators | `2025-09-01` | `Threat Intelligence Indicator Delete API` - https://learn.microsoft.com/en-us/rest/api/securityinsights/threat-intelligence-indicator/delete?view=rest-securityinsights-2025-09-01&tabs=HTTP |
 
 **Not currently used:** The [Microsoft Graph Security Threat Intelligence API](https://learn.microsoft.com/en-us/graph/api/resources/security-threatintelligence-overview?view=graph-rest-1.0) is not used by this toolkit at this time, but will be considered for future updates.
@@ -247,10 +247,6 @@ If you are seeing `429 Too Many Requests`, tune in this order:
 3. Lower `$ConcurrentWorkers` if you still see burst-related throttling on PowerShell 7+.
 
 For most production cleanup runs, `ConcurrentWorkers=1..2`, `TargetDeleteRatePerSecond=0.20..0.25`, and `ProgressRefreshIntervalSeconds=60..180` are safer defaults than increasing parallelism.
-
-### Progress updates
-
-During deletion the script maintains a single `0-100%` progress bar. Every `ProgressRefreshIntervalSeconds`, the script pauses briefly, recounts the remaining indicators for the active source filter, updates the progress bar, and then resumes deleting.
 
 ### Indicator removal process status
 
