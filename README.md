@@ -51,7 +51,7 @@ This returns the billed volume in GB and indicator count broken down by source â
 
 ### Cleaning up with this script
 
-With the source name identified, set `$SourceFilter` in `Invoke-RemoveSentinelThreatIndicator.ps1` to one or more source values and run the script. It will count all matching indicators, prompt for confirmation, then delete them in batches â€” handling pagination, token refresh, and rate limiting automatically.
+With the source name identified, set `$SourceFilter` in `Invoke-RemoveSentinelThreatIndicator.ps1` to one or more source values and run the script. `SourceFilter` is mandatory for safety: if it is missing, empty, or contains only blank values, the run aborts before any delete operations. The script then counts all matching indicators, prompts for confirmation, and deletes in batches while handling pagination, token refresh, and rate limiting automatically.
 
 The screenshot below shows the indicator delete progress view used during bulk cleanup runs:
 
@@ -106,12 +106,14 @@ The screenshot below shows the indicator delete progress view used during bulk c
 
 1. **Edit the configuration** in `Invoke-RemoveSentinelThreatIndicator.ps1`:
 
+   Rate conversion reference: `req/hour = req/s * 3600` (examples: `1.0 -> 3600/hour`, `10.0 -> 36000/hour`).
+
    ```powershell
     $SubscriptionId    = "<subscription-guid>"       # Required: Azure subscription GUID containing the Sentinel workspace
     $ResourceGroupName = "<resource-group-name>"     # Required: Azure resource group name containing the workspace
     $WorkspaceName     = "<workspace-name>"          # Required: Log Analytics workspace name linked to Sentinel
     $BatchSize         = 100                         # Number of indicators to delete in each batch 
-    $SourceFilter      = @("<source-name>")          # one or more sources, e.g. @("ThreatViewIPBlockList","ThreatViewURLBlockList")
+   $SourceFilter      = @("<source-name>")          # Required for safety; one or more sources, e.g. @("ThreatViewIPBlockList","ThreatViewURLBlockList"). Empty/missing values abort the run.
     $ConcurrentWorkers = 5                           # Max concurrent DELETE workers; sustained rate is controlled separately by TargetDeleteRatePerSecond
     $TargetDeleteRatePerSecond = 10.0                # Sustained DELETE rate across all workers. Start with 1.0 req/s as a safe baseline (~3600/hour).         Higher values (for example 10.0 req/s) can speed up overall processing but increase the chance of throttling (HTTP 429), depending on tenant and subscription limits.
     $ShowAPIWarnings = $false                        # When set, writes per-request 401/429 throttle diagnostics to the console. By default these messages are suppressed.
@@ -125,6 +127,8 @@ The screenshot below shows the indicator delete progress view used during bulk c
    ```powershell
     .\Scripts\Invoke-RemoveSentinelThreatIndicator.ps1
    ```
+
+Operator note: `ConcurrentWorkers=1` runs sequentially, and values greater than `1` run parallel deletes. In both modes, sustained throughput is globally rate-limited by `TargetDeleteRatePerSecond`.
 
 ---
 

@@ -110,7 +110,7 @@ function Remove-SentinelThreatIndicators {
     . $loggerScriptPath
     Initialize-ToolkitLogger -LogFile $LogFile -RunId $RunId
 
-    Write-Log ([ordered]@{ event = 'run_started'; subscription_id = $SubscriptionId; resource_group = $ResourceGroupName; workspace = $WorkspaceName; source_filter = $(if ($SourceFilter) { $SourceFilter -join ', ' } else { '(all sources)' }) })
+    Write-Log ([ordered]@{ event = 'run_started'; subscription_id = $SubscriptionId; resource_group = $ResourceGroupName; workspace = $WorkspaceName; source_filter = ($SourceFilter -join ', ') })
 
     $toolkitVersion = '1.0.0'
 
@@ -285,7 +285,7 @@ function Remove-SentinelThreatIndicators {
     function New-DeleteRateState {
         param([double]$RatePerSecond)
 
-        $effectiveRate = if ($RatePerSecond -gt 0) { $RatePerSecond } else { 0.25 }
+        $effectiveRate = if ($RatePerSecond -gt 0) { $RatePerSecond } else { 1.0 }
 
         return [hashtable]::Synchronized(@{
             Capacity         = 1.0
@@ -428,7 +428,7 @@ function Remove-SentinelThreatIndicators {
         return
     }
 
-    $logSourceFilter = if ($SourceFilter) { $SourceFilter -join ', ' } else { '(all sources)' }
+    $logSourceFilter = $SourceFilter -join ', '
 
     $headers = @{
         "Authorization" = "Bearer $token"
@@ -465,14 +465,12 @@ function Remove-SentinelThreatIndicators {
             [hashtable]$Headers,
             [string]$Uri,
             [string[]]$Source,
-            [int]$Size,
-            [string]$SkipToken
+            [int]$Size
         )
         $requestUri = Resolve-AbsoluteApiUri -CandidateUri $Uri
         $body = [ordered]@{ pageSize = $Size }
         $body.sortBy = @(@{ itemKey = "lastUpdatedTimeUtc"; sortOrder = "descending" })
         if ($Source) { $body.sources = @($Source) }
-        if ($SkipToken) { $body.skipToken = $SkipToken }
 
         $response = $null
         try {
@@ -618,7 +616,7 @@ function Remove-SentinelThreatIndicators {
             try {
                 if ($Sync) { $Sync.QuerySubmitted++ }
 
-                $pageResult = Get-IndicatorPage -Headers $Headers -Uri $State.QueryPageUri -Source $State.SourceFilter -Size $Size -SkipToken $null
+                $pageResult = Get-IndicatorPage -Headers $Headers -Uri $State.QueryPageUri -Source $State.SourceFilter -Size $Size
                 $batch = @($pageResult.Items)
                 $batchCount = $batch.Count
                 $State.QueryPageUri = $pageResult.NextLink
@@ -695,7 +693,7 @@ function Remove-SentinelThreatIndicators {
     Write-Output "===== Preflight ====="
     Write-Log ([ordered]@{ event = 'preflight_token'; status = 'access_token_acquired' })
     Write-Status -Level PASS -Message "Access token acquired."
-    Write-Log ([ordered]@{ event = 'preflight_config'; run_id = $RunId; log_file = $logFileDisplay })
+    Write-Log ([ordered]@{ event = 'preflight_config'; log_file = $logFileDisplay })
     Write-Status -Level INFO -Message "Run ID/Log file: $RunId | $logFileDisplay"
     Write-Log ([ordered]@{ event = 'preflight_config'; subscription_id = $SubscriptionId })
     Write-Status -Level INFO -Message "Subscription ID: $SubscriptionId"
@@ -703,8 +701,8 @@ function Remove-SentinelThreatIndicators {
     Write-Status -Level INFO -Message "Resource group: $ResourceGroupName"
     Write-Log ([ordered]@{ event = 'preflight_config'; workspace = $WorkspaceName })
     Write-Status -Level INFO -Message "Target workspace: $WorkspaceName"
-    Write-Log ([ordered]@{ event = 'preflight_config'; source_filter = $(if ($SourceFilter) { $SourceFilter -join ', ' } else { '(all sources)' }) })
-    Write-Status -Level INFO -Message "Source filter: $(if ($SourceFilter) { $SourceFilter -join ', ' } else { "(all sources)" })"
+    Write-Log ([ordered]@{ event = 'preflight_config'; source_filter = ($SourceFilter -join ', ') })
+    Write-Status -Level INFO -Message "Source filter: $($SourceFilter -join ', ')"
     Write-Log ([ordered]@{ event = 'preflight_config'; execution_mode = $(if ($PSVersionTable.PSVersion.Major -ge 7 -and $ConcurrentWorkers -gt 1) { 'parallel' } else { 'sequential' }); concurrent_workers = $ConcurrentWorkers })
     Write-Status -Level INFO -Message "Execution mode: $(if ($PSVersionTable.PSVersion.Major -ge 7 -and $ConcurrentWorkers -gt 1) { "Parallel (ConcurrentWorkers=$ConcurrentWorkers)" } else { "Sequential" })"
     Write-Log ([ordered]@{ event = 'preflight_config'; delete_rate_per_hour = $([math]::Round($TargetDeleteRatePerSecond * 3600, 0)) })
@@ -751,22 +749,17 @@ function Remove-SentinelThreatIndicators {
     Write-Output "====================="
 
     if ($totalFound -eq 0) {
-        Write-Output "No indicators found$(if ($SourceFilter) { " for source(s) '$($SourceFilter -join "', '")'" }). Nothing to delete."
+        Write-Output "No indicators found for source(s) '$($SourceFilter -join "', '")'. Nothing to delete."
         Write-Log ([ordered]@{ event = 'run_completed'; source_filter = $logSourceFilter; deleted = 0; failed = 0; reason = 'nothing to delete' })
         return
     }
 
     Write-Output ""
-    Write-Output "Found $totalFound indicator(s)$(if ($SourceFilter) { " from source(s) '$($SourceFilter -join "', '")'" })."
+    Write-Output "Found $totalFound indicator(s) from source(s) '$($SourceFilter -join "', '")'."
     Write-Output ""
     Write-Log ([ordered]@{ event = 'delete_started'; source_filter = $logSourceFilter; found = $totalFound })
 
-    $deleteScope = if ($SourceFilter -and $SourceFilter.Count -gt 0) {
-        "$totalFound indicator(s) in workspace '$WorkspaceName' for source(s) '$($SourceFilter -join ", ")'"
-    }
-    else {
-        "$totalFound indicator(s) in workspace '$WorkspaceName' (all sources)"
-    }
+    $deleteScope = "$totalFound indicator(s) in workspace '$WorkspaceName' for source(s) '$($SourceFilter -join ", ")'"
     if (-not $PSCmdlet.ShouldProcess($deleteScope, "Delete threat intelligence indicators")) {
         Write-Output "WhatIf: no indicators were deleted."
         Write-Log ([ordered]@{ event = 'run_completed'; source_filter = $logSourceFilter; whatif = $true; simulated = $totalFound; deleted = 0; failed = 0 })
@@ -979,6 +972,7 @@ function Remove-SentinelThreatIndicators {
                 $apiVer     = $using:apiVersion
                 $rateState  = $using:deleteRateState
                 $warnStats  = $using:apiWarningStats
+                $showApiWarnings = $using:ShowAPIWarnings
 
                 $name      = $_.name
                 $deleteUri = "$delBase/$name`?api-version=$apiVer"
@@ -1095,7 +1089,7 @@ function Remove-SentinelThreatIndicators {
                                     $hdrs["Authorization"] = "Bearer $newToken"
                                     $did401Refresh = $true
                                     $warnStats.Http401++
-                                    if ($ShowAPIWarnings) {
+                                    if ($showApiWarnings) {
                                         Write-Warning "  401 Unauthorized - token refreshed, retrying..."
                                     }
                                     $attempt--
@@ -1109,7 +1103,7 @@ function Remove-SentinelThreatIndicators {
                             $warnStats.Http429++
                             $retryInfo = & $getRetryAfter $_ (5 * $attempt)
                             & $setCooldown $rateState $retryInfo.ResumeAtUtc
-                            if ($ShowAPIWarnings) {
+                            if ($showApiWarnings) {
                                 $rawText = if ($retryInfo.Raw) { "'$($retryInfo.Raw)'" } else { "(missing)" }
                                 $resumeUtc = $retryInfo.ResumeAtUtc.ToString("yyyy-MM-dd HH:mm:ss 'UTC'")
                                 Write-Warning "  429 Too Many Requests — raw Retry-After=$rawText; interpreted wait=$($retryInfo.Seconds)s; resume ~$resumeUtc (attempt $attempt/$maxRetries)..."
@@ -1292,7 +1286,7 @@ function Remove-SentinelThreatIndicators {
     Write-Status -Level $summaryLevel -Message "Deletion run completed."
     Write-Output "Run ID        : $RunId"
     Write-Output "Mode          : $executionMode"
-    Write-Output "Source filter : $(if ($SourceFilter) { $SourceFilter -join ', ' } else { "(all sources)" })"
+    Write-Output "Source filter : $($SourceFilter -join ', ')"
     Write-Output "Found         : $(if ($countIsExact) { "$totalFound" } else { ">=$totalFound (count incomplete)" })"
     Write-Output "Deleted       : $deleted"
     Write-Output "Failed        : $failed"
