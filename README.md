@@ -36,8 +36,8 @@ These ingestion options allow organizations to centralize threat intelligence in
 
 ### The problem: indicator bloat
 
-Over time, a Microsoft Sentinel workspace can accumulate a large number of threat intelligence indicators (IoCs). While indicators are typically expected to expire automatically, this does not always happen in practice.
-In many cases, indicators are created during testing or validation activities where setting an expiration date is overlooked. Additionally, some indicators may be ingested without an expiration date or are not actively maintained after import.
+Over time, a Microsoft Sentinel workspace can accumulate a large number of threat intelligence indicators (IoCs). 
+While indicators are typically expected to expire automatically, this may not always be consistently enforced in practice. A common root cause is missing expiration dates on IOCs, often originating from testing activities. 
 As a result, outdated or irrelevant indicators remain in the workspace while new ones continue to be added, leading to a steady increase in the overall number of IoCs.
 
 The screenshot below shows an example workspace with over **6.3 million indicators**:
@@ -84,14 +84,11 @@ With the source name identified, set `$SourceFilter` in `Invoke-RemoveSentinelTh
 > [!NOTE]  
 > - **Scope limited to ThreatIntelIndicators**  
 >   The current script only supports removal of indicators from the `ThreatIntelIndicators` table.  
->   Management of `ThreatIntelObjects` requires the newer Defender Threat Intelligence API, which is not covered here as it could not be tested without the required licensing.  
+>   Management of `ThreatIntelObjects` requires the newer [Microsoft Graph Security Threat Intelligence API](https://learn.microsoft.com/en-us/graph/api/resources/security-threatintelligence-overview?view=graph-rest-1.0), which is not covered here since I currently do not have the required license to access this API.  
 >
 > - **Source-based deletion only**  
->   The script removes all indicators associated with the specified `Source`.  
->   There is currently no filtering based on additional IoC properties (such as type, confidence, or expiration).  
->
-> - **Future improvements**  
->   A future version of this toolkit is planned to support more granular cleanup options, allowing deletion based on additional IoC attributes.
+>  The script removes all indicators associated with the specified `Source`.  
+>  More granular filtering (for example based on IoC properties such as type, confidence, or expiration) is not currently supported, but is planned for a future version of the toolkit.
 
 The screenshot below shows the indicator delete progress view used during bulk cleanup runs:
 
