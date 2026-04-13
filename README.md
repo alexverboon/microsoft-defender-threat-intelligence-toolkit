@@ -12,9 +12,33 @@ A community PowerShell toolkit for managing **Microsoft Sentinel Threat Intellig
 
 The toolkit was developed to support Security Operations Teams and security engineers in managing threat intelligence (TI) indicators, including bulk deletion from a Microsoft Sentinel workspace.
 
+## Threat Intelligence in Microsoft Sentinel
+
+Threat intelligence describes information about existing or potential threats, including both high-level insights (such as threat actors and techniques) and low-level indicators like IP addresses, domains, URLs, and file hashes.
+In Microsoft Sentinel, the most commonly used form is threat indicators (IoCs), which link observed artifacts to known malicious activity and are used to detect threats and enrich investigations.
+
+### Ingesting Threat Intelligence
+
+Microsoft Sentinel provides multiple supported methods to ingest and manage threat intelligence:
+
+- **Data connectors**  
+  Import intelligence from external platforms and feeds, including Microsoft Defender Threat Intelligence and STIX/TAXII sources  
+- **Upload API**  
+  Send curated threat intelligence (STIX objects) directly from custom applications or TIP solutions via REST API  
+- **TAXII connector (STIX/TAXII standard)**  
+  Use the built-in TAXII client to ingest intelligence from industry-standard feeds  
+- **Threat Intelligence Platform connector (legacy)**  
+  API-based ingestion limited to indicators, currently being deprecated in favor of the upload API  
+
+These ingestion options allow organizations to centralize threat intelligence in the workspace, where it can be stored, managed, and used for detection, hunting, and analysis.
+
+[Also see:](https://learn.microsoft.com/en-us/azure/sentinel/understand-threat-intelligence)
+
 ### The problem: indicator bloat
 
-Over time, a Microsoft Sentinel workspace can accumulate a very large number of threat intelligence indicators. A common cause is automated threat feed ingestion from MDTI or other third-party sources that import indicators into Sentinel on a schedule. Each import cycle adds new indicators, and unless old ones are actively expired or deleted, the total count grows unbounded.
+Over time, a Microsoft Sentinel workspace can accumulate a large number of threat intelligence indicators (IoCs). While indicators are typically expected to expire automatically, this does not always happen in practice.
+In many cases, indicators are created during testing or validation activities where setting an expiration date is overlooked. Additionally, some indicators may be ingested without an expiration date or are not actively maintained after import.
+As a result, outdated or irrelevant indicators remain in the workspace while new ones continue to be added, leading to a steady increase in the overall number of IoCs.
 
 The screenshot below shows an example workspace with over **6.3 million indicators**:
 
@@ -56,6 +80,18 @@ This returns the billed volume in GB and indicator count broken down by source â
 ### Cleaning up with this script
 
 With the source name identified, set `$SourceFilter` in `Invoke-RemoveSentinelThreatIndicator.ps1` to one or more source values and run the script. The script then counts all matching indicators, prompts for confirmation, and deletes in batches while handling pagination, token refresh, and rate limiting automatically.
+
+> [!NOTE]  
+> - **Scope limited to ThreatIntelIndicators**  
+>   The current script only supports removal of indicators from the `ThreatIntelIndicators` table.  
+>   Management of `ThreatIntelObjects` requires the newer Defender Threat Intelligence API, which is not covered here as it could not be tested without the required licensing.  
+>
+> - **Source-based deletion only**  
+>   The script removes all indicators associated with the specified `Source`.  
+>   There is currently no filtering based on additional IoC properties (such as type, confidence, or expiration).  
+>
+> - **Future improvements**  
+>   A future version of this toolkit is planned to support more granular cleanup options, allowing deletion based on additional IoC attributes.
 
 The screenshot below shows the indicator delete progress view used during bulk cleanup runs:
 
