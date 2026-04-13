@@ -32,7 +32,7 @@ Microsoft Sentinel provides multiple supported methods to ingest and manage thre
 
 These ingestion options allow organizations to centralize threat intelligence in the workspace, where it can be stored, managed, and used for detection, hunting, and analysis.
 
-[Also see:](https://learn.microsoft.com/en-us/azure/sentinel/understand-threat-intelligence)
+For more details see: [Threat intelligence in Microsoft Sentinel](https://learn.microsoft.com/en-us/azure/sentinel/understand-threat-intelligence)
 
 ### The problem: indicator bloat
 
