@@ -150,7 +150,7 @@ The screenshot below shows the indicator delete progress view used during bulk c
     $ResourceGroupName = "<resource-group-name>"     # Required: Azure resource group name containing the workspace
     $WorkspaceName     = "<workspace-name>"          # Required: Log Analytics workspace name linked to Sentinel
     $BatchSize         = 100                         # Number of indicators to delete in each batch 
-      $SourceFilter      = @("<source-name>")          # Required for safety; one or more sources, e.g. @("ThreatViewIPBlockList","ThreatViewURLBlockList"). Empty/missing values abort the run.
+    $SourceFilter      = @("<source-name>")          # Required for safety; one or more sources, e.g. @("ThreatViewIPBlockList","ThreatViewURLBlockList"). Empty/missing values abort the run.
     $ConcurrentWorkers = 5                           # Max concurrent DELETE workers; sustained rate is controlled separately by TargetDeleteRatePerSecond
     $TargetDeleteRatePerSecond = 10.0                # Sustained DELETE rate across all workers. Start with 1.0 req/s as a safe baseline (~3600/hour).         Higher values (for example 10.0 req/s) can speed up overall processing but increase the chance of throttling (HTTP 429), depending on tenant and subscription limits.
     $ShowAPIWarnings = $false                        # When set, writes per-request 401/429 throttle diagnostics to the console. By default these messages are suppressed.
@@ -194,6 +194,16 @@ The toolkit currently uses the following Microsoft Sentinel / SecurityInsights R
 - Function to retrieve indicator information based on source or other IoC attributes.
 - Deletion of indicators based on additional patterns such as IP address, TLP, URL, and similar fields.
 - Function to quickly import IoCs from CSV.
+
+
+## Disclaimer
+
+> [!IMPORTANT]  
+> This project is provided "as is" without any warranties or guarantees.  
+> Always test scripts and configurations in a non-production (lab/test) environment before using them in production.  
+>  
+> The author assumes no responsibility or liability for any issues, damages, or data loss resulting from the use of this project.
+
 
 ## License
 
