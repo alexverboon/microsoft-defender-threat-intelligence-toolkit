@@ -189,6 +189,12 @@ The toolkit currently uses the following Microsoft Sentinel / SecurityInsights R
 
 **Not currently used:** The [Microsoft Graph Security Threat Intelligence API](https://learn.microsoft.com/en-us/graph/api/resources/security-threatintelligence-overview?view=graph-rest-1.0) is not used by this toolkit at this time, but will be considered for future updates.
 
+## Planned Enhancements
+
+- Function to retrieve indicator information based on source or other IoC attributes.
+- Deletion of indicators based on additional patterns such as IP address, TLP, URL, and similar fields.
+- Function to quickly import IoCs from CSV.
+
 ## License
 
-See [LICENSE](LICENSE).
+See [LICENSE](./LICENSE).
