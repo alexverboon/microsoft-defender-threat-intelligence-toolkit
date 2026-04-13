@@ -14,7 +14,7 @@ The toolkit was developed to support Security Operations Teams and security engi
 
 ### The problem: indicator bloat
 
-Over time, a Microsoft Sentinel workspace can accumulate a very large number of threat intelligence indicators. A common cause is automated threat feed ingestion — feeds such as ThreatView, MDTI, or other third-party sources push indicators into Sentinel on a schedule. Each import cycle adds new indicators, and unless old ones are actively expired or deleted, the total count grows unbounded.
+Over time, a Microsoft Sentinel workspace can accumulate a very large number of threat intelligence indicators. A common cause is automated threat feed ingestion from MDTI or other third-party sources that import indicators into Sentinel on a schedule. Each import cycle adds new indicators, and unless old ones are actively expired or deleted, the total count grows unbounded.
 
 The screenshot below shows an example workspace with over **6.3 million indicators**:
 
@@ -32,9 +32,9 @@ In the example above, filtering by `ThreatViewURLBlockList` and `ThreatViewIPBlo
 
 ### Impact on Log Analytics costs
 
-A high indicator count does not only affect portal usability — it also directly drives up the size of the `ThreatIntelIndicators` and `ThreatIntelObjects` tables in Log Analytics, which contributes to ingestion and retention costs.
+A high indicator count does not only affect portal usability, it also directly drives up the size of the `ThreatIntelIndicators` and `ThreatIntelObjects` tables in Log Analytics, which contributes to ingestion and retention costs.
 
-The screenshot below (from the Microsoft Sentinel workspace workbook) shows how the TI-related tables contribute to overall data volume:
+The screenshot below (from the Microsoft Sentinel workspace usage workbook) shows how the TI-related tables contribute to overall data volume:
 
 ![TI table usage from workspace workbook](docs/images/ti-tables-usage-from-workbook.png)
 
@@ -55,7 +55,7 @@ This returns the billed volume in GB and indicator count broken down by source �
 
 ### Cleaning up with this script
 
-With the source name identified, set `$SourceFilter` in `Invoke-RemoveSentinelThreatIndicator.ps1` to one or more source values and run the script. `SourceFilter` is mandatory for safety: if it is missing, empty, or contains only blank values, the run aborts before any delete operations. The script then counts all matching indicators, prompts for confirmation, and deletes in batches while handling pagination, token refresh, and rate limiting automatically.
+With the source name identified, set `$SourceFilter` in `Invoke-RemoveSentinelThreatIndicator.ps1` to one or more source values and run the script. The script then counts all matching indicators, prompts for confirmation, and deletes in batches while handling pagination, token refresh, and rate limiting automatically.
 
 The screenshot below shows the indicator delete progress view used during bulk cleanup runs:
 
